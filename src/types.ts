@@ -1,5 +1,10 @@
 export type UserRole = 'buyer' | 'farmer' | 'admin' | 'transporter';
 
+/** DA Admin verification workflow. Every new Farmer/Buyer account starts
+ *  'Pending' — approval by the DA Admin Console unlocks full transactional
+ *  access (farmers may submit harvests, buyers may place orders). */
+export type VerificationStatus = 'Pending' | 'Approved' | 'Rejected';
+
 export interface UserProfile {
   id: string;
   name: string;
@@ -18,6 +23,34 @@ export interface UserProfile {
   lastActive?: string;
   vehicleType?: string;
   plateNumber?: string;
+  /** VeggieConnect Pay wallet balance in pesos (buyers top this up via Deposit). */
+  walletBalance?: number;
+  /** Wallet ledger — deposits, order payments and refunds (newest last). */
+  walletTransactions?: WalletTransaction[];
+  /** DA verification queue state — 'Pending' right after signup. */
+  verificationStatus?: VerificationStatus;
+  /** When the registration was submitted (Admin queue sorting). */
+  submittedAt?: string;
+  /** REQUIRED at signup for both roles — reviewed by the DA Admin. */
+  validIdImage?: string;
+  /** Farmer only, OPTIONAL — RSBSA registry number (e.g. 07-46-10-001-000001). */
+  rsbsaNumber?: string;
+  /** Buyer only, OPTIONAL — Barangay Clearance / DTI / Business Permit photo. */
+  businessProofImage?: string;
+}
+
+export type WalletTransactionType = 'deposit' | 'payment' | 'refund';
+
+export interface WalletTransaction {
+  id: string;
+  type: WalletTransactionType;
+  /** Positive amount in pesos. Direction comes from the type. */
+  amount: number;
+  /** Wallet balance right after this transaction settled. */
+  balanceAfter: number;
+  description: string;
+  orderId?: string;
+  timestamp: string;
 }
 
 export type VegetableCategory =
@@ -107,6 +140,44 @@ export interface CartItem {
   quantity: number;
 }
 
+/** One farmer (or warehouse) lot used to fulfil an order line. Kept separate
+ *  from order_items: a single buyer line can be split across several farmers
+ *  with different farmgate asking prices (multi-farmer split allocation). */
+export interface SourcingAllocation {
+  id: string;
+  /** Farmer listing id this allocation drew stock from. */
+  produceId: string;
+  farmerId?: string;
+  farmerName?: string;
+  farmName?: string;
+  cropName: string;
+  /** kg taken from this farmer. */
+  quantity: number;
+  /** Farmer's farmgate asking price per kg at allocation time. */
+  farmgatePrice: number;
+  allocatedAt: string;
+  /** Warehouse shelf stock (already paid for) vs a fresh farmer purchase. */
+  isWarehouse?: boolean;
+}
+
+/** Admin's proposal to re-price a crop the farmers sell above the fixed
+ *  buyer market price. Buyer approves before the admin buys from farmers:
+ *  proposed buyer price = new farmgate × 1.10. */
+export interface PriceAdjustmentQuote {
+  id: string;
+  cropName: string;
+  /** The fixed buyer market price currently on the order line. */
+  currentBuyerPrice: number;
+  /** The farmgate price the admin would have to pay (above the buyer price). */
+  proposedFarmgatePrice: number;
+  /** proposedFarmgatePrice × 1.10 — what the buyer would pay if approved. */
+  proposedBuyerPrice: number;
+  reason?: string;
+  status: 'pending' | 'approved' | 'declined';
+  createdAt?: string;
+  respondedAt?: string;
+}
+
 export interface OrderItem {
   produceId: string;
   produceName: string;
@@ -120,6 +191,13 @@ export interface OrderItem {
   farmerName?: string;
   farmName?: string;
   imageUrl?: string;
+  /** Admin availability ruling for this product line. When 'unavailable', the
+   *  line's amount is returned to the buyer's wallet (if already paid) or
+   *  removed from the bill (if not yet paid) — the order itself continues. */
+  itemStatus?: 'available' | 'unavailable';
+  /** Amount returned / not charged for this line when unavailable. */
+  refundedAmount?: number;
+  refundedAt?: string;
 }
 
 export type OrderStatus =
@@ -162,6 +240,28 @@ export interface Order {
   cancelledBy?: string;
   /** Exactly-once guard: request-lot warehouse stock already deducted for this order. */
   requestStockDeducted?: boolean;
+  /** Multi-farmer split allocation — WHICH farmers supplied each crop, at
+   *  which farmgate price, kept separate from the buyer-facing items. */
+  sourcingAllocations?: SourcingAllocation[];
+  /** Σ (allocation kg × farmgate price) across farmers (fresh purchases only). */
+  sourcingCostTotal?: number;
+  /** sourcingCostTotal ÷ farmer-sourced kg — e.g. ₱65.80/kg. */
+  weightedAvgSourcingCost?: number;
+  /** Buyer revenue − farmer sourcing cost — the Admin's net margin on this order. */
+  netAdminProfit?: number;
+  /** Price Adjustment Quotes raised when farmers ask above the fixed buyer price. */
+  priceQuotes?: PriceAdjustmentQuote[];
+  /** Wallet payment lifecycle: the buyer pays AFTER the admin approves the
+   *  order and BEFORE the live transaction (transport/pickup) may occur. */
+  paymentStatus?: 'unpaid' | 'paid';
+  paidAt?: string;
+  /** Amount actually charged to the buyer's wallet (total minus pre-payment
+   *  refunds for unavailable products). */
+  paidAmount?: number;
+  /** Total value of products the admin marked unavailable. */
+  refundedTotal?: number;
+  /** Portion of the payment already credited back to the buyer's wallet. */
+  refundedCredited?: number;
   createdAt?: string;
   transporterId?: string;
   transporterName?: string;
@@ -258,6 +358,19 @@ export interface DABulletinMeta {
  * Universal criteria for whether a produce item is currently in Live Supermarket Stock.
  * Must have stockQuantity > 0 and be marked as owned/stocked by VeggieConnect Supermarket.
  */
+/** Line total for an order item (quantity × unit price). */
+export const orderItemAmount = (item?: OrderItem | null): number =>
+  Number((Number(item?.quantity) || 0) * (Number(item?.unitPrice ?? item?.pricePerUnit) || 0)) || 0;
+
+/** What the buyer still owes: order total minus amounts returned for
+ *  unavailable products (never below zero). */
+export const orderPayable = (order?: Order | null): number => {
+  if (!order) return 0;
+  const total = Number(order.totalAmount ?? order.subtotal) || 0;
+  const refunded = Number(order.refundedTotal) || 0;
+  return Math.max(0, Math.round((total - refunded) * 100) / 100);
+};
+
 export const isLiveSupermarketStock = (p?: Partial<ProduceItem> | null): boolean => {
   if (!p) return false;
   const isSupermarket =

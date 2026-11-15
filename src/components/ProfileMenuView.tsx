@@ -20,6 +20,7 @@ import {
   MessageSquare,
   Map,
   Trash2,
+  Wallet,
 } from 'lucide-react';
 import { UserProfile, UserRole } from '../types';
 import { resolveCoordinates } from '../utils/geoDistance';
@@ -293,6 +294,26 @@ export const ProfileMenuView: React.FC<ProfileMenuViewProps> = ({
             </span>
             <ArrowRight className="w-3.5 h-3.5 text-emerald-600" />
           </button>
+
+          {/* Buyer Wallet shortcut — deposit money and pay approved orders */}
+          {currentUser.role === 'buyer' && (
+            <button
+              id="btn-profile-wallet"
+              onClick={() => onNavigateTab && onNavigateTab('wallet')}
+              className="col-span-2 flex items-center justify-between p-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-700 hover:to-green-700 text-white text-xs font-bold transition-colors cursor-pointer shadow-sm"
+            >
+              <span className="flex items-center gap-1.5">
+                <Wallet className="w-4 h-4" />
+                <span>VeggieConnect Pay Wallet</span>
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="text-[11px] font-black bg-white/20 rounded-lg px-2 py-0.5 font-mono">
+                  ₱{(Number(currentUser.walletBalance) || 0).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </span>
+            </button>
+          )}
         </div>
       </div>
 

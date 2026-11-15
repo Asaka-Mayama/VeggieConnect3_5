@@ -1,0 +1,1008 @@
+     1→import React, { useState } from 'react';
+     2→import {
+     3→  Sprout,
+     4→  ShoppingBag,
+     5→  Lock,
+     6→  Phone,
+     7→  Mail,
+     8→  MapPin,
+     9→  User,
+    10→  ArrowRight,
+    11→  CheckCircle2,
+    12→  AlertCircle,
+    13→  Shield,
+    14→  IdCard,
+    15→  ImagePlus,
+    16→  FileImage,
+    17→  Trash2,
+    18→  Clock3,
+    19→} from 'lucide-react';
+    20→import { UserRole, UserProfile } from '../types';
+    21→import { AddressMapPickerModal } from './AddressMapPickerModal';
+    22→import { ThemeToggleButton } from './ThemeToggleButton';
+    23→import { fileToChatPhotoDataUrl } from '../utils/chatImage';
+    24→import { describeDocFileError, isValidRsbsaNumber, RSBSA_FORMAT_HINT } from '../utils/verification';
+    25→
+    26→interface LoginRegisterViewProps {
+    27→  onLoginSuccess: (user: UserProfile) => void;
+    28→}
+    29→
+    30→const REGISTERED_USERS_KEY = 'veggieconnect_registered_users_v9';
+    31→
+    32→function normalizePhone(p?: string): string {
+    33→  if (!p) return '';
+    34→  return p.replace(/[\s\-\+\(\)]/g, '').replace(/^63/, '0');
+    35→}
+    36→
+    37→interface DocumentUploadFieldProps {
+    38→  inputId: string;
+    39→  label: string;
+    40→  required?: boolean;
+    41→  helperText?: string;
+    42→  /** Error shown under the field (file type/size validation). */
+    43→  error?: string | null;
+    44→  /** Compressed data URL of the picked photo — drives the preview thumbnail. */
+    45→  preview: string;
+    46→  onPickFile: (file: File | null) => void;
+    47→  onRemove: () => void;
+    48→  /** Green (farmer scope) vs blue (buyer scope) accent for the selected state. */
+    49→  tone?: 'farmer' | 'buyer' | 'neutral';
+    50→}
+    51→
+    52→// Shared upload tile for the registration documents (Valid ID / Business
+    53→// Proof). Accepts .jpg/.jpeg/.png up to 5MB and shows a preview thumbnail
+    54→// once a photo has been selected.
+    55→const DocumentUploadField: React.FC<DocumentUploadFieldProps> = ({
+    56→  inputId,
+    57→  label,
+    58→  required,
+    59→  helperText,
+    60→  error,
+    61→  preview,
+    62→  onPickFile,
+    63→  onRemove,
+    64→  tone = 'neutral',
+    65→}) => {
+    66→  const toneClasses =
+    67→    tone === 'farmer'
+    68→      ? 'border-emerald-300 bg-emerald-50/40 hover:border-emerald-500'
+    69→      : tone === 'buyer'
+    70→      ? 'border-sky-300 bg-sky-50/40 hover:border-sky-500'
+    71→      : 'border-emerald-200 bg-emerald-50/40 hover:border-emerald-500';
+    72→
+    73→  return (
+    74→    <div>
+    75→      <label className="block text-xs font-semibold text-emerald-950 mb-1">
+    76→        {label} {required && <span className="text-red-500">*</span>}
+    77→      </label>
+    78→
+    79→      {preview ? (
+    80→        <div className="relative rounded-2xl border border-emerald-200 bg-white overflow-hidden">
+    81→          <div className="flex items-center gap-2.5 p-2.5">
+    82→            <img
+    83→              src={preview}
+    84→              alt={`${label} preview`}
+    85→              className="w-16 h-16 rounded-xl object-cover border border-neutral-200 flex-shrink-0"
+    86→            />
+    87→            <div className="min-w-0 flex-1">
+    88→              <p className="text-[11px] font-bold text-emerald-800 flex items-center gap-1">
+    89→                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0" />
+    90→                Document attached
+    91→              </p>
+    92→              <p className="text-[10px] text-neutral-500 mt-0.5">
+    93→                .jpg / .jpeg / .png — max 5MB · ready for DA review
+    94→              </p>
+    95→              <button
+    96→                type="button"
+    97→                id={`${inputId}-remove`}
+    98→                onClick={onRemove}
+    99→                className="mt-1.5 inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 text-[10px] font-bold cursor-pointer transition-colors"
+   100→              >
+   101→                <Trash2 className="w-3 h-3" />
+   102→                <span>Remove photo</span>
+   103→              </button>
+   104→            </div>
+   105→          </div>
+   106→        </div>
+   107→      ) : (
+   108→        <label
+   109→          htmlFor={inputId}
+   110→          className={`flex items-center gap-2.5 w-full rounded-2xl border border-dashed py-3 px-3 cursor-pointer transition-colors ${toneClasses}`}
+   111→        >
+   112→          <span className="w-9 h-9 rounded-xl bg-white border border-neutral-200 flex items-center justify-center flex-shrink-0">
+   113→            <ImagePlus className="w-4.5 h-4.5 text-emerald-600" />
+   114→          </span>
+   115→          <span className="min-w-0">
+   116→            <span className="block text-[11px] font-bold text-neutral-800">
+   117→              Upload photo (.jpg / .jpeg / .png)
+   118→            </span>
+   119→            <span className="block text-[10px] text-neutral-500 mt-0.5">
+   120→              {helperText || 'Tap to choose a clear photo — max 5MB'}
+   121→            </span>
+   122→          </span>
+   123→        </label>
+   124→      )}
+   125→
+   126→      <input
+   127→        id={inputId}
+   128→        type="file"
+   129→        accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+   130→        className="hidden"
+   131→        onChange={(e) => {
+   132→          const file = e.target.files && e.target.files.length > 0 ? e.target.files[0] : null;
+   133→          onPickFile(file);
+   134→          // Allow re-picking the same file after a removal.
+   135→          e.target.value = '';
+   136→        }}
+   137→      />
+   138→
+   139→      {error && (
+   140→        <p className="text-[10px] text-red-600 font-semibold mt-1 flex items-center gap-1">
+   141→          <AlertCircle className="w-3 h-3 flex-shrink-0" />
+   142→          {error}
+   143→        </p>
+   144→      )}
+   145→    </div>
+   146→  );
+   147→};
+   148→
+   149→export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
+   150→  onLoginSuccess,
+   151→}) => {
+   152→  // Load registered users from localStorage
+   153→  const getRegisteredUsers = (): UserProfile[] => {
+   154→    try {
+   155→      const saved = localStorage.getItem(REGISTERED_USERS_KEY);
+   156→      if (saved) {
+   157→        return JSON.parse(saved);
+   158→      }
+   159→    } catch (e) {
+   160→      console.error('Error loading registered users', e);
+   161→    }
+   162→    return [];
+   163→  };
+   164→
+   165→  const [activeTab, setActiveTab] = useState<'intro' | 'login' | 'register'>('intro');
+   166→  const [selectedRole, setSelectedRole] = useState<UserRole>('farmer');
+   167→
+   168→  // Login Form State
+   169→  const [loginIdentifier, setLoginIdentifier] = useState('');
+   170→  const [loginPassword, setLoginPassword] = useState('');
+   171→  const [loginError, setLoginError] = useState<string | null>(null);
+   172→  const [isSubmitting, setIsSubmitting] = useState(false);
+   173→
+   174→  // Register Form State
+   175→  const [regName, setRegName] = useState('');
+   176→  const [regPhone, setRegPhone] = useState('');
+   177→  const [regEmail, setRegEmail] = useState('');
+   178→  const [regPassword, setRegPassword] = useState('');
+   179→  const [regLocation, setRegLocation] = useState('Dumaguete City, Negros Oriental');
+   180→  const [regFarmName, setRegFarmName] = useState('');
+   181→  const [regError, setRegError] = useState<string | null>(null);
+   182→
+   183→  // DA verification documents:
+   184→  //  - Valid Government ID  — REQUIRED for BOTH roles (jpg/jpeg/png ≤ 5MB)
+   185→  //  - RSBSA Number         — Farmer only, OPTIONAL (validated only when filled)
+   186→  //  - Small Business Proof — Buyer only, OPTIONAL (Barangay Clearance / DTI / Permit)
+   187→  const [regValidIdPreview, setRegValidIdPreview] = useState('');
+   188→  const [regValidIdError, setRegValidIdError] = useState<string | null>(null);
+   189→  const [regRsbsa, setRegRsbsa] = useState('');
+   190→  const [regBusinessProofPreview, setRegBusinessProofPreview] = useState('');
+   191→  const [regBusinessProofError, setRegBusinessProofError] = useState<string | null>(null);
+   192→  const [isCompressingDoc, setIsCompressingDoc] = useState(false);
+   193→
+   194→  const pickDocument = async (
+   195→    file: File | null,
+   196→    setPreview: (v: string) => void,
+   197→    setError: (v: string | null) => void
+   198→  ) => {
+   199→    if (!file) return;
+   200→    const fileError = describeDocFileError(file);
+   201→    if (fileError) {
+   202→      setError(fileError);
+   203→      return;
+   204→    }
+   205→    setError(null);
+   206→    setIsCompressingDoc(true);
+   207→    try {
+   208→      // Downscale to a bandwidth-friendly JPEG data URL so the document
+   209→      // survives localStorage, the in-memory API store and the XAMPP MySQL
+   210→      // LONGTEXT columns without bloating the payload.
+   211→      const dataUrl = await fileToChatPhotoDataUrl(file, 1280, 0.78);
+   212→      setPreview(dataUrl);
+   213→    } catch (e: any) {
+   214→      setError(e?.message || 'Could not read the selected image.');
+   215→    } finally {
+   216→      setIsCompressingDoc(false);
+   217→    }
+   218→  };
+   219→
+   220→  // MAP-REQUIRED REGISTRATION: the account can ONLY be created after the user
+   221→  // pins their exact location on the Google Map. A typed address alone is not
+   222→  // accepted — "set location first on the map, then create the account".
+   223→  const [pinnedLocation, setPinnedLocation] = useState<{ address: string; lat: number; lng: number } | null>(null);
+   224→  const [showRegMap, setShowRegMap] = useState(false);
+   225→  const continueSignupAfterPinRef = React.useRef(false);
+   226→
+   227→  const saveRegisteredUser = (user: UserProfile) => {
+   228→    const users = getRegisteredUsers();
+   229→    const updated = [...users.filter((u) => u.id !== user.id), user];
+   230→    localStorage.setItem(REGISTERED_USERS_KEY, JSON.stringify(updated));
+   231→  };
+   232→
+   233→  // Handle Login
+   234→  const handleLogin = async (e: React.FormEvent) => {
+   235→    e.preventDefault();
+   236→    setLoginError(null);
+   237→
+   238→    const identifier = loginIdentifier.trim().toLowerCase();
+   239→    if (!identifier) {
+   240→      setLoginError('Please enter your mobile phone number or email.');
+   241→      return;
+   242→    }
+   243→
+   244→    if (identifier === 'admin' || identifier === 'admin@gmail.com' || identifier === 'admin desk') {
+   245→      setLoginError('incorrect password or username');
+   246→      return;
+   247→    }
+   248→
+   249→    if (!loginPassword) {
+   250→      setLoginError('incorrect password or username');
+   251→      return;
+   252→    }
+   253→
+   254→    setIsSubmitting(true);
+   255→
+   256→    try {
+   257→      // Try backend authentication
+   258→      const resp = await fetch('/api/auth/login', {
+   259→        method: 'POST',
+   260→        headers: { 'Content-Type': 'application/json' },
+   261→        body: JSON.stringify({
+   262→          phone: identifier,
+   263→          email: identifier,
+   264→          password: loginPassword,
+   265→        }),
+   266→      });
+   267→
+   268→      const data = await resp.json();
+   269→
+   270→      if (!resp.ok) {
+   271→        setLoginError('incorrect password or username');
+   272→        setIsSubmitting(false);
+   273→        return;
+   274→      }
+   275→
+   276→      if (data.user) {
+   277→        if (data.user.role === 'admin') {
+   278→          setLoginError('incorrect password or username');
+   279→          setIsSubmitting(false);
+   280→          return;
+   281→        }
+   282→        saveRegisteredUser(data.user);
+   283→        onLoginSuccess(data.user);
+   284→        return;
+   285→      }
+   286→    } catch (err) {
+   287→      console.log('Backend login unreachable:', err);
+   288→      setLoginError('incorrect password or username');
+   289→    } finally {
+   290→      setIsSubmitting(false);
+   291→    }
+   292→  };
+   293→
+   294→  // Handle Registration
+   295→  const createAccount = async (pin: { address: string; lat: number; lng: number }) => {
+   296→    setIsSubmitting(true);
+   297→
+   298→    const trimmedName = regName.trim();
+   299→    const rawPhone = regPhone.trim();
+   300→    const rawEmail = rawEmailSafe(regEmail.trim());
+   301→
+   302→    const newUser: UserProfile = {
+   303→      id: `user-${Date.now()}`,
+   304→      name: trimmedName,
+   305→      email: rawEmail || `${trimmedName.toLowerCase().replace(/\s+/g, '')}@dgte-agri.ph`,
+   306→      phone: rawPhone,
+   307→      role: selectedRole,
+   308→      // Location comes strictly from the confirmed map pin (never a typed guess)
+   309→      location: pin.address,
+   310→      latitude: pin.lat,
+   311→      longitude: pin.lng,
+   312→      farmName: selectedRole === 'farmer' ? regFarmName.trim() : undefined,
+   313→      avatar: '',
+   314→      // DA verification workflow: NO immediate transactional access. The
+   315→      // account enters the Admin Console's Pending User Verifications queue
+   316→      // and only an explicit Approve unlocks harvesting / ordering.
+   317→      verificationStatus: 'Pending',
+   318→      submittedAt: new Date().toISOString(),
+   319→      validIdImage: regValidIdPreview,
+   320→      rsbsaNumber: selectedRole === 'farmer' ? regRsbsa.trim() : undefined,
+   321→      businessProofImage: selectedRole === 'buyer' ? regBusinessProofPreview : undefined,
+   322→      verified: false,
+   323→      status: 'active',
+   324→    };
+   325→
+   326→    // The backend is the single source of truth for the account identity.
+   327→    // Continue the session with the account the SERVER actually stored — its id
+   328→    // is what every crop listing, order and chat will be linked to.
+   329→    let registeredUser: UserProfile = newUser;
+   330→    try {
+   331→      const resp = await fetch('/api/auth/signup', {
+   332→        method: 'POST',
+   333→        headers: { 'Content-Type': 'application/json' },
+   334→        body: JSON.stringify({
+   335→          ...newUser,
+   336→          password: regPassword,
+   337→        }),
+   338→      });
+   339→
+   340→      const data = await resp.json();
+   341→      if (!resp.ok) {
+   342→        setRegError(data.error || 'Failed to register account.');
+   343→        setIsSubmitting(false);
+   344→        return;
+   345→      }
+   346→
+   347→      if (data.user && data.user.id) {
+   348→        registeredUser = data.user;
+   349→      }
+   350→    } catch (err) {
+   351→      console.log('Backend signup notice:', err);
+   352→    } finally {
+   353→      setIsSubmitting(false);
+   354→    }
+   355→
+   356→    saveRegisteredUser(registeredUser);
+   357→    onLoginSuccess(registeredUser);
+   358→  };
+   359→
+   360→  const handleRegister = async (e: React.FormEvent) => {
+   361→    e.preventDefault();
+   362→    setRegError(null);
+   363→
+   364→    const trimmedName = regName.trim();
+   365→    const rawPhone = regPhone.trim();
+   366→    const rawEmail = rawEmailSafe(regEmail.trim());
+   367→    const normName = trimmedName.toLowerCase();
+   368→    const normPhone = normalizePhone(rawPhone);
+   369→    const normEmail = rawEmail.toLowerCase();
+   370→
+   371→    if (!trimmedName) {
+   372→      setRegError('Please enter your full name.');
+   373→      return;
+   374→    }
+   375→    if (!rawPhone) {
+   376→      setRegError('Please enter your active Mobile No.');
+   377→      return;
+   378→    }
+   379→    if (!regPassword.trim()) {
+   380→      setRegError('Please choose a password.');
+   381→      return;
+   382→    }
+   383→    if (selectedRole === 'farmer' && !regFarmName.trim()) {
+   384→      setRegError('Please enter your Farm name.');
+   385→      return;
+   386→    }
+   387→
+   388→    // MANDATORY VERIFICATION FIELD (both roles): a Valid Government ID photo
+   389→    // must be attached before the registration can be submitted for review.
+   390→    if (!regValidIdPreview) {
+   391→      setRegError('A Valid Government ID photo is required — upload a clear .jpg/.jpeg/.png image (max 5MB) to submit your registration.');
+   392→      return;
+   393→    }
+   394→
+   395→    // Farmer role-specific: RSBSA Number is OPTIONAL — the format is only
+   396→    // validated when the farmer actually types something in.
+   397→    if (selectedRole === 'farmer' && regRsbsa.trim() && !isValidRsbsaNumber(regRsbsa)) {
+   398→      setRegError(`The RSBSA Number looks invalid. ${RSBSA_FORMAT_HINT}, or leave the field empty.`);
+   399→      return;
+   400→    }
+   401→
+   402→    // Local Duplicate Validations across all existing users
+   403→    const existingUsers = getRegisteredUsers();
+   404→
+   405→    // Check duplicate name
+   406→    const dupName = existingUsers.find((u) => u.name && u.name.trim().toLowerCase() === normName);
+   407→    if (dupName) {
+   408→      setRegError(`An account with the name "${trimmedName}" is already registered. Please use a unique full name.`);
+   409→      return;
+   410→    }
+   411→
+   412→    // Check duplicate phone
+   413→    if (normPhone) {
+   414→      const dupPhone = existingUsers.find((u) => u.phone && normalizePhone(u.phone) === normPhone);
+   415→      if (dupPhone) {
+   416→        setRegError(`An account with the mobile number "${rawPhone}" is already registered.`);
+   417→        return;
+   418→      }
+   419→    }
+   420→
+   421→    // Check duplicate email
+   422→    if (normEmail) {
+   423→      const dupEmail = existingUsers.find((u) => u.email && u.email.trim().toLowerCase() === normEmail);
+   424→      if (dupEmail) {
+   425→        setRegError(`An account with the email "${rawEmail}" is already registered.`);
+   426→        return;
+   427→      }
+   428→    }
+   429→
+   430→    // REQUIREMENT: the user must set their location on the map FIRST.
+   431→    // No account is ever created from a typed address alone — open the
+   432→    // map picker now and continue signup automatically after the pin is
+   433→    // confirmed.
+   434→    if (!pinnedLocation) {
+   435→      continueSignupAfterPinRef.current = true;
+   436→      setShowRegMap(true);
+   437→      setRegError('Please pin your exact location on the map to create your account.');
+   438→      return;
+   439→    }
+   440→
+   441→    await createAccount(pinnedLocation);
+   442→  };
+   443→
+   444→  function rawEmailSafe(str: string) {
+   445→    return str || '';
+   446→  }
+   447→
+   448→  // 1. INTRODUCTION / GET STARTED APP SPLASH SCREEN (PURE GREEN APP BACKGROUND)
+   449→  if (activeTab === 'intro') {
+   450→    return (
+   451→      <div className="relative min-h-[580px] sm:min-h-[720px] flex-1 flex flex-col justify-between p-6 overflow-hidden text-white select-none bg-gradient-to-b from-emerald-700 via-emerald-800 to-emerald-950">
+   452→        {/* Per-role dark mode toggle (guest scope before logging in) */}
+   453→        <div className="absolute top-4 right-4 z-20">
+   454→          <ThemeToggleButton id="btn-intro-theme-toggle" tone="dark" />
+   455→        </div>
+   456→        {/* Decorative Ambient Green Lighting Effects */}
+   457→        <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden">
+   458→          <div className="absolute -top-20 -right-20 w-72 h-72 rounded-full bg-emerald-500/30 blur-3xl" />
+   459→          <div className="absolute top-1/3 -left-16 w-64 h-64 rounded-full bg-teal-400/20 blur-3xl" />
+   460→          <div className="absolute -bottom-20 right-0 w-80 h-80 rounded-full bg-emerald-600/20 blur-3xl" />
+   461→        </div>
+   462→
+   463→        {/* Top App Header Pill */}
+   464→        <div className="relative z-10 pt-2 flex items-center justify-between">
+   465→          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-white/15 backdrop-blur-md border border-white/20 text-[11px] font-bold tracking-wide text-emerald-200 shadow-sm">
+   466→            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+   467→            <span>Direct Agricultural Network</span>
+   468→          </div>
+   469→
+   470→          <span className="text-[10px] font-extrabold text-emerald-100 bg-emerald-950/70 backdrop-blur-md px-2.5 py-1 rounded-full border border-emerald-400/20">
+   471→            Negros Oriental
+   472→          </span>
+   473→        </div>
+   474→
+   475→        {/* Center Hero Showcase */}
+   476→        <div className="relative z-10 py-6 my-auto space-y-4">
+   477→          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-emerald-400 to-emerald-600 flex items-center justify-center text-white shadow-2xl shadow-emerald-950/80 border border-white/30">
+   478→            <Sprout className="w-9 h-9 stroke-[2.3]" />
+   479→          </div>
+   480→
+   481→          <div className="space-y-1">
+   482→            <h1 className="text-3xl font-black tracking-tight text-white font-display drop-shadow-md leading-tight">
+   483→              Veggie<span className="text-emerald-300">Connect</span>
+   484→            </h1>
+   485→            <p className="text-xs font-bold text-emerald-300 uppercase tracking-widest">
+   486→              Direct Vegetable Market App
+   487→            </p>
+   488→          </div>
+   489→
+   490→          <p className="text-sm text-emerald-50 leading-relaxed font-medium max-w-xs drop-shadow-sm">
+   491→            Your platform to buy or sell fresh vegetables in bulk across Negros Oriental. From easy ordering and managed deliveries to price checks with DA Bantay Presyo, we make wholesale trading simple for everyone.
+   492→          </p>
+   493→        </div>
+   494→
+   495→        {/* Bottom Call to Actions */}
+   496→        <div className="relative z-10 space-y-2.5 pt-4">
+   497→          <button
+   498→            id="btn-intro-get-started"
+   499→            onClick={() => {
+   500→              setActiveTab('register');
+   501→              setLoginError(null);
+   502→              setRegError(null);
+   503→            }}
+   504→            className="w-full py-3.5 px-4 bg-emerald-500 hover:bg-emerald-400 text-white font-black text-sm rounded-2xl shadow-xl shadow-emerald-950/70 flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-[0.98]"
+   505→          >
+   506→            <span>Get Started</span>
+   507→            <ArrowRight className="w-4 h-4 stroke-[2.5]" />
+   508→          </button>
+   509→
+   510→          <button
+   511→            id="btn-intro-login"
+   512→            onClick={() => {
+   513→              setActiveTab('login');
+   514→              setLoginError(null);
+   515→              setRegError(null);
+   516→            }}
+   517→            className="w-full py-3 px-4 bg-white/15 hover:bg-white/25 text-white font-bold text-xs rounded-2xl backdrop-blur-md border border-white/25 flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-[0.98]"
+   518→          >
+   519→            <span>I already have an account · Log In</span>
+   520→          </button>
+   521→        </div>
+   522→
+   523→      </div>
+   524→    );
+   525→  }
+   526→
+   527→  return (
+   528→    <>
+   529→    <div className="relative min-h-full flex flex-col justify-center px-4 py-8 max-w-md mx-auto w-full text-neutral-900 bg-[#f4f9f4]">
+   530→      {/* Per-role dark mode toggle (guest scope before logging in) */}
+   531→      <div className="absolute top-3 right-3 z-20">
+   532→        <ThemeToggleButton id="btn-auth-theme-toggle" />
+   533→      </div>
+   534→      {/* Brand Header */}
+   535→      <div className="text-center mb-6">
+   536→        <div className="w-14 h-14 mx-auto rounded-2xl bg-emerald-600 flex items-center justify-center shadow-lg shadow-emerald-700/20 text-white mb-3">
+   537→          <Sprout className="w-8 h-8" />
+   538→        </div>
+   539→        <h1 className="text-2xl font-black tracking-tight text-emerald-950 font-display">
+   540→          Veggie<span className="text-emerald-600">Connect</span>
+   541→        </h1>
+   542→        <p className="text-xs text-emerald-800/80 font-medium mt-1">
+   543→          Direct Farmer & Buyer Network (Negros Oriental)
+   544→        </p>
+   545→      </div>
+   546→
+   547→      {/* Login vs Register Tab Selector */}
+   548→      <div className="bg-emerald-100/60 p-1 rounded-2xl border border-emerald-200/80 flex mb-5">
+   549→        <button
+   550→          id="tab-login"
+   551→          onClick={() => {
+   552→            setActiveTab('login');
+   553→            setLoginError(null);
+   554→            setRegError(null);
+   555→          }}
+   556→          className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+   557→            activeTab === 'login'
+   558→              ? 'bg-emerald-600 text-white shadow-xs'
+   559→              : 'text-emerald-900/70 hover:text-emerald-950'
+   560→          }`}
+   561→        >
+   562→          Log In
+   563→        </button>
+   564→        <button
+   565→          id="tab-register"
+   566→          onClick={() => {
+   567→            setActiveTab('register');
+   568→            setLoginError(null);
+   569→            setRegError(null);
+   570→          }}
+   571→          className={`flex-1 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
+   572→            activeTab === 'register'
+   573→              ? 'bg-emerald-600 text-white shadow-xs'
+   574→              : 'text-emerald-900/70 hover:text-emerald-950'
+   575→          }`}
+   576→        >
+   577→          Register (New User)
+   578→        </button>
+   579→      </div>
+   580→
+   581→      {/* LOGIN FORM */}
+   582→      {activeTab === 'login' && (
+   583→        <form onSubmit={handleLogin} className="space-y-4 bg-white border border-emerald-100/90 rounded-3xl p-5 shadow-sm">
+   584→          <div className="border-b border-emerald-100 pb-3">
+   585→            <h2 className="text-base font-bold text-emerald-950">Log in to your account</h2>
+   586→            <p className="text-xs text-neutral-500 mt-0.5">
+   587→              Enter your registered phone number or email address
+   588→            </p>
+   589→          </div>
+   590→
+   591→          {loginError && (
+   592→            <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-start gap-2">
+   593→              <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+   594→              <span>{loginError}</span>
+   595→            </div>
+   596→          )}
+   597→
+   598→          <div>
+   599→            <label className="block text-xs font-semibold text-emerald-950 mb-1">
+   600→              Mobile Number or Email
+   601→            </label>
+   602→            <div className="relative">
+   603→              <Phone className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   604→              <input
+   605→                id="input-login-id"
+   606→                type="text"
+   607→                value={loginIdentifier}
+   608→                onChange={(e) => setLoginIdentifier(e.target.value)}
+   609→                placeholder="0917 123 4567 or email"
+   610→                className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 focus:outline-none focus:border-emerald-600 focus:bg-white transition-all"
+   611→                required
+   612→              />
+   613→            </div>
+   614→          </div>
+   615→
+   616→          <div>
+   617→            <label className="block text-xs font-semibold text-emerald-950 mb-1">
+   618→              Password
+   619→            </label>
+   620→            <div className="relative">
+   621→              <Lock className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   622→              <input
+   623→                id="input-login-password"
+   624→                type="password"
+   625→                value={loginPassword}
+   626→                onChange={(e) => setLoginPassword(e.target.value)}
+   627→                placeholder="Enter password"
+   628→                className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 focus:outline-none focus:border-emerald-600 focus:bg-white transition-all"
+   629→              />
+   630→            </div>
+   631→          </div>
+   632→
+   633→          <button
+   634→            id="btn-submit-login"
+   635→            type="submit"
+   636→            disabled={isSubmitting}
+   637→            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md shadow-emerald-700/20 flex items-center justify-center gap-2 transition-all active:scale-[0.98] mt-2 cursor-pointer"
+   638→          >
+   639→            <span>{isSubmitting ? 'Logging in...' : 'Log In to VeggieConnect'}</span>
+   640→            <ArrowRight className="w-4 h-4" />
+   641→          </button>
+   642→
+   643→          <div className="text-center pt-2">
+   644→            <p className="text-xs text-neutral-500">
+   645→              Need a new member account?{' '}
+   646→              <button
+   647→                type="button"
+   648→                onClick={() => {
+   649→                  setActiveTab('register');
+   650→                  setLoginError(null);
+   651→                }}
+   652→                className="text-emerald-700 hover:underline font-bold cursor-pointer"
+   653→              >
+   654→                Register here
+   655→              </button>
+   656→            </p>
+   657→          </div>
+   658→        </form>
+   659→      )}
+   660→
+   661→      {/* REGISTER FORM */}
+   662→      {activeTab === 'register' && (
+   663→        <form onSubmit={handleRegister} className="space-y-4 bg-white border border-emerald-100/90 rounded-3xl p-5 shadow-sm">
+   664→          <div className="border-b border-emerald-100 pb-3">
+   665→            <h2 className="text-base font-bold text-emerald-950">Create New Account</h2>
+   666→            <p className="text-xs text-neutral-500 mt-0.5">
+   667→              Select whether you are a Farmer or a Buyer
+   668→            </p>
+   669→          </div>
+   670→
+   671→          {regError && (
+   672→            <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-start gap-2">
+   673→              <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+   674→              <span>{regError}</span>
+   675→            </div>
+   676→          )}
+   677→
+   678→          {/* Role Selection: Farmer vs Buyer */}
+   679→          <div>
+   680→            <label className="block text-xs font-semibold text-emerald-950 mb-1.5">
+   681→              Select Your Role
+   682→            </label>
+   683→            <div className="grid grid-cols-2 gap-2.5">
+   684→              <button
+   685→                type="button"
+   686→                id="role-select-farmer"
+   687→                onClick={() => setSelectedRole('farmer')}
+   688→                className={`p-3 rounded-2xl border text-center transition-all cursor-pointer ${
+   689→                  selectedRole === 'farmer'
+   690→                    ? 'bg-emerald-50 border-emerald-600 text-emerald-900 shadow-xs ring-2 ring-emerald-600'
+   691→                    : 'bg-neutral-50 border-neutral-200 text-neutral-600 hover:text-neutral-900'
+   692→                }`}
+   693→              >
+   694→                <div className="text-2xl mb-1">👨‍🌾</div>
+   695→                <div className="text-xs font-bold leading-tight">Farmer</div>
+   696→                <div className="text-[10px] text-neutral-500 mt-0.5">Grower / Mag-uuma</div>
+   697→              </button>
+   698→
+   699→              <button
+   700→                type="button"
+   701→                id="role-select-buyer"
+   702→                onClick={() => setSelectedRole('buyer')}
+   703→                className={`p-3 rounded-2xl border text-center transition-all cursor-pointer ${
+   704→                  selectedRole === 'buyer'
+   705→                    ? 'bg-sky-50 border-sky-600 text-sky-900 shadow-xs ring-2 ring-sky-600'
+   706→                    : 'bg-neutral-50 border-neutral-200 text-neutral-600 hover:text-neutral-900'
+   707→                }`}
+   708→              >
+   709→                <div className="text-2xl mb-1">🛒</div>
+   710→                <div className="text-xs font-bold leading-tight">Buyer</div>
+   711→                <div className="text-[10px] text-neutral-500 mt-0.5">Customer / Mamalitay</div>
+   712→              </button>
+   713→            </div>
+   714→          </div>
+   715→
+   716→          {/* Full Name */}
+   717→          <div>
+   718→            <label className="block text-xs font-semibold text-emerald-950 mb-1">
+   719→              Full Name <span className="text-red-500">*</span>
+   720→            </label>
+   721→            <div className="relative">
+   722→              <User className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   723→              <input
+   724→                id="input-reg-name"
+   725→                type="text"
+   726→                placeholder="e.g. Juan dela Cruz"
+   727→                value={regName}
+   728→                onChange={(e) => setRegName(e.target.value)}
+   729→                className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
+   730→                required
+   731→              />
+   732→            </div>
+   733→          </div>
+   734→
+   735→          {/* Phone Number */}
+   736→          <div>
+   737→            <label className="block text-xs font-semibold text-emerald-950 mb-1">
+   738→              Mobile No. <span className="text-red-500">*</span>
+   739→            </label>
+   740→            <div className="relative">
+   741→              <Phone className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   742→              <input
+   743→                id="input-reg-phone"
+   744→                type="text"
+   745→                placeholder="+63 917 123 4567"
+   746→                value={regPhone}
+   747→                onChange={(e) => setRegPhone(e.target.value)}
+   748→                className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
+   749→                required
+   750→              />
+   751→            </div>
+   752→          </div>
+   753→
+   754→          {/* Email Address */}
+   755→          <div>
+   756→            <label className="block text-xs font-semibold text-emerald-950 mb-1">
+   757→              Email Address
+   758→            </label>
+   759→            <div className="relative">
+   760→              <Mail className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   761→              <input
+   762→                id="input-reg-email"
+   763→                type="email"
+   764→                placeholder="juan@gmail.com"
+   765→                value={regEmail}
+   766→                onChange={(e) => setRegEmail(e.target.value)}
+   767→                className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
+   768→              />
+   769→            </div>
+   770→          </div>
+   771→
+   772→          {/* Password */}
+   773→          <div>
+   774→            <label className="block text-xs font-semibold text-emerald-950 mb-1">
+   775→              Password <span className="text-red-500">*</span>
+   776→            </label>
+   777→            <div className="relative">
+   778→              <Lock className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   779→              <input
+   780→                id="input-reg-password"
+   781→                type="password"
+   782→                placeholder="Create password"
+   783→                value={regPassword}
+   784→                onChange={(e) => setRegPassword(e.target.value)}
+   785→                className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
+   786→                required
+   787→              />
+   788→            </div>
+   789→          </div>
+   790→
+   791→          {/* Location — REQUIRED: must be pinned on the map before account creation */}
+   792→          <div>
+   793→            <div className="flex items-center justify-between mb-1">
+   794→              <label className="text-xs font-semibold text-emerald-950">
+   795→                Location / Municipality
+   796→              </label>
+   797→              <span
+   798→                className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+   799→                  pinnedLocation
+   800→                    ? 'bg-emerald-100 text-emerald-700'
+   801→                    : 'bg-amber-100 text-amber-700'
+   802→                }`}
+   803→              >
+   804→                {pinnedLocation ? '✓ Pinned on Map' : 'Map Pin Required'}
+   805→              </span>
+   806→            </div>
+   807→            <button
+   808→              id="btn-open-reg-map"
+   809→              type="button"
+   810→              onClick={() => {
+   811→                continueSignupAfterPinRef.current = false;
+   812→                setShowRegMap(true);
+   813→              }}
+   814→              className="w-full bg-emerald-50/40 border border-emerald-200 hover:border-emerald-500 rounded-xl py-2.5 pl-9 pr-3 text-left text-xs text-neutral-900 transition-colors cursor-pointer relative"
+   815→              title="Open the map to pin your exact location"
+   816→            >
+   817→              <MapPin className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   818→              <span className={`block truncate ${pinnedLocation ? 'font-semibold' : 'text-neutral-500'}`}>
+   819→                {pinnedLocation
+   820→                  ? pinnedLocation.address
+   821→                  : `${regLocation} — tap to pin on map`}
+   822→              </span>
+   823→            </button>
+   824→            <p className="text-[10px] text-neutral-500 mt-1 flex items-center gap-1">
+   825→              <MapPin className="w-3 h-3 text-emerald-600 flex-shrink-0" />
+   826→              Required: set your exact location on the map before creating your account
+   827→            </p>
+   828→          </div>
+   829→
+   830→          {/* MANDATORY VERIFICATION DOCUMENT — Valid Government ID (both roles).
+   831→              Placed directly below Location / Municipality per the DA spec. */}
+   832→          <DocumentUploadField
+   833→            inputId="input-reg-valid-id"
+   834→            label="Valid Government ID"
+   835→            required
+   836→            tone={selectedRole === 'buyer' ? 'buyer' : 'farmer'}
+   837→            helperText={
+   838→              isCompressingDoc
+   839→                ? 'Processing photo…'
+   840→                : 'Required: clear photo of a government ID (.jpg/.jpeg/.png, max 5MB)'
+   841→            }
+   842→            preview={regValidIdPreview}
+   843→            error={regValidIdError}
+   844→            onPickFile={(file) => pickDocument(file, setRegValidIdPreview, setRegValidIdError)}
+   845→            onRemove={() => {
+   846→              setRegValidIdPreview('');
+   847→              setRegValidIdError(null);
+   848→            }}
+   849→          />
+   850→          <p className="-mt-2 text-[10px] text-neutral-500 flex items-start gap-1">
+   851→            <IdCard className="w-3 h-3 text-emerald-600 flex-shrink-0 mt-0.5" />
+   852→            <span>
+   853→              Your registration will be reviewed by the DA Admin. Pending accounts can browse the app but cannot sell or order yet.
+   854→            </span>
+   855→          </p>
+   856→
+   857→          {/* Role-specific fields */}
+   858→          {selectedRole === 'farmer' && (
+   859→            <>
+   860→              <div>
+   861→                <label className="block text-xs font-semibold text-emerald-800 mb-1">
+   862→                  Farm Name <span className="text-red-500">*</span>
+   863→                </label>
+   864→                <div className="relative">
+   865→                  <Sprout className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   866→                  <input
+   867→                    id="input-reg-farm"
+   868→                    type="text"
+   869→                    placeholder="e.g. Valencia Highland Organic Farm"
+   870→                    value={regFarmName}
+   871→                    onChange={(e) => setRegFarmName(e.target.value)}
+   872→                    className="w-full bg-emerald-50/40 border border-emerald-300 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
+   873→                    required
+   874→                  />
+   875→                </div>
+   876→              </div>
+   877→
+   878→              {/* RSBSA Number — OPTIONAL: only validated when a value is entered */}
+   879→              <div>
+   880→                <label className="block text-xs font-semibold text-emerald-800 mb-1">
+   881→                  RSBSA Number (Optional)
+   882→                </label>
+   883→                <div className="relative">
+   884→                  <FileImage className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+   885→                  <input
+   886→                    id="input-reg-rsbsa"
+   887→                    type="text"
+   888→                    placeholder="e.g. 07-46-10-001-000001 (Optional)"
+   889→                    value={regRsbsa}
+   890→                    onChange={(e) => setRegRsbsa(e.target.value)}
+   891→                    className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
+   892→                  />
+   893→                </div>
+   894→                <p className="text-[10px] text-neutral-500 mt-1 flex items-center gap-1">
+   895→                  <CheckCircle2 className="w-3 h-3 text-emerald-600 flex-shrink-0" />
+   896→                  Registry Number for Basic Sector in Agriculture — earn a <span className="font-bold">“DA Registered”</span> badge once approved
+   897→                </p>
+   898→              </div>
+   899→            </>
+   900→          )}
+   901→
+   902→          {selectedRole === 'buyer' && (
+   903→            <DocumentUploadField
+   904→              inputId="input-reg-business-proof"
+   905→              label="Small Business Proof (Optional)"
+   906→              tone="buyer"
+   907→              helperText={
+   908→                isCompressingDoc
+   909→                  ? 'Processing photo…'
+   910→                  : 'Optional: Barangay Clearance, DTI, or Business Permit for small businesses'
+   911→              }
+   912→              preview={regBusinessProofPreview}
+   913→              error={regBusinessProofError}
+   914→              onPickFile={(file) => pickDocument(file, setRegBusinessProofPreview, setRegBusinessProofError)}
+   915→              onRemove={() => {
+   916→                setRegBusinessProofPreview('');
+   917→                setRegBusinessProofError(null);
+   918→              }}
+   919→            />
+   920→          )}
+   921→
+   922→          <button
+   923→            id="btn-submit-register"
+   924→            type="submit"
+   925→            disabled={isSubmitting || isCompressingDoc}
+   926→            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md shadow-emerald-700/20 flex items-center justify-center gap-2 transition-all active:scale-[0.98] mt-2 cursor-pointer disabled:opacity-70 disabled:cursor-not-allowed"
+   927→          >
+   928→            <span>
+   929→              {isSubmitting
+   930→                ? 'Submitting Registration…'
+   931→                : isCompressingDoc
+   932→                ? 'Processing document…'
+   933→                : 'Submit Registration for Verification'}
+   934→            </span>
+   935→            <Clock3 className="w-4 h-4" />
+   936→          </button>
+   937→
+   938→          <p className="text-center text-[10px] text-neutral-500 -mt-1.5">
+   939→            <Shield className="w-3 h-3 inline text-emerald-600" /> A “Pending Admin Approval” banner will appear in your account until the DA verifies your Valid ID.
+   940→          </p>
+   941→
+   942→          <div className="text-center pt-2">
+   943→            <p className="text-xs text-neutral-500">
+   944→              Already have an account?{' '}
+   945→              <button
+   946→                type="button"
+   947→                onClick={() => {
+   948→                  setActiveTab('login');
+   949→                  setRegError(null);
+   950→                }}
+   951→                className="text-emerald-700 hover:underline font-bold cursor-pointer"
+   952→              >
+   953→                Log in here
+   954→              </button>
+   955→            </p>
+   956→          </div>
+   957→        </form>
+   958→      )}
+   959→
+   960→      {/* Subtle build marker — lets the owner confirm which build is running. */}
+   961→      <p className="text-center text-[10px] text-neutral-400 pt-5 pb-1 select-none">
+   962→        VeggieConnect · Build v3.6 (DA Verification Queue • Valid Government ID Upload • RSBSA &amp; Business Proof • Pending Approval Gating)
+   963→      </p>
+   964→    </div>
+   965→
+   966→      {/* REQUIRED LOCATION MAP PICKER
+   967→          The account is ONLY created after the user pins their exact location
+   968→          on the Google Map (buyer: house / delivery address, farmer: farm
+   969→          location). Rendered as a sibling of the login root so `absolute
+   970→          inset-0` anchors to the phone shell — it always fits INSIDE the
+   971→          app frame, exactly like every other in-app modal. */}
+   972→      {showRegMap && (
+   973→        <AddressMapPickerModal
+   974→          title={selectedRole === 'farmer' ? 'Set Your Farm Location' : 'Set Your Location'}
+   975→          subtitle={
+   976→            selectedRole === 'farmer'
+   977→              ? 'Pin your exact farm location on the map — required to create your account'
+   978→              : 'Pin your exact house / delivery address on the map — required to create your account'
+   979→          }
+   980→          initialAddress={pinnedLocation ? pinnedLocation.address : regLocation}
+   981→          initialLat={pinnedLocation ? pinnedLocation.lat : undefined}
+   982→          initialLng={pinnedLocation ? pinnedLocation.lng : undefined}
+   983→          onClose={() => {
+   984→            setShowRegMap(false);
+   985→            if (continueSignupAfterPinRef.current) {
+   986→              continueSignupAfterPinRef.current = false;
+   987→              setRegError('Location is required: pin your exact location on the map, then create your account.');
+   988→            }
+   989→          }}
+   990→          onConfirmLocation={(address, lat, lng) => {
+   991→            const pin = { address, lat, lng };
+   992→            setPinnedLocation(pin);
+   993→            setRegLocation(address);
+   994→            setShowRegMap(false);
+   995→            if (continueSignupAfterPinRef.current) {
+   996→              continueSignupAfterPinRef.current = false;
+   997→              setRegError(null);
+   998→              createAccount(pin);
+   999→            }
+  1000→          }}
+  1001→        />
+  1002→      )}
+  1003→    </>
+  1004→  );
+  1005→};
+  1006→
+  1007→
+  1008→

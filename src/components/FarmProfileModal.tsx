@@ -157,11 +157,6 @@ export const FarmProfileModal: React.FC<FarmProfileModalProps> = ({
                     key={item.id}
                     produce={item}
                     onSelect={onSelectProduce}
-                    onRequestProduct={(prod) =>
-                      window.dispatchEvent(
-                        new CustomEvent('veggieconnect:request-product', { detail: prod })
-                      )
-                    }
                     isBuyer={isBuyer}
                   />
                 ))}

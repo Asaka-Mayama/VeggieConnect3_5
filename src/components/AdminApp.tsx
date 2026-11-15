@@ -9,6 +9,7 @@ import {
   Search,
   CheckCircle2,
   XCircle,
+  AlertTriangle,
   Clock,
   ExternalLink,
   LogOut,
@@ -60,8 +61,24 @@ import {
   Navigation,
   Image as ImageIcon,
   Smile,
+  BadgeCheck,
+  IdCard,
+  ShieldX,
 } from 'lucide-react';
-import { UserProfile, ProduceItem, Order, TransportJob, DirectMessage, DAPriceItem, DABulletinMeta } from '../types';
+import { UserProfile, ProduceItem, Order, TransportJob, DirectMessage, DAPriceItem, DABulletinMeta, PriceAdjustmentQuote, VerificationStatus } from '../types';
+import { buildSourcingPlan, LOW_MARGIN_RATE } from '../utils/sourcing';
+import type { SourcingLot, SourcingPlanLine } from '../utils/sourcing';
+import { verificationStateOf, isVerificationPending } from '../utils/verification';
+import { VerificationReviewModal } from './VerificationReviewModal';
+import {
+  getOrderDateKey,
+  formatDateKeyLabel,
+  formatDateKeyShort,
+  sortDateKeysDesc,
+  orderAmount,
+  orderFarmgateCost,
+  isFarmerProcurementOrder,
+} from '../utils/orderDates';
 import { appSync } from '../utils/appSync';
 import { CHAT_EMOJIS, chatPhotoPreviewText, fileToChatPhotoDataUrl } from '../utils/chatImage';
 import { ThemeToggleButton } from './ThemeToggleButton';
@@ -136,6 +153,12 @@ interface AdminAppProps {
     cancelReason?: string,
     cancelledBy?: string
   ) => void;
+  /** Admin availability ruling: mark one ordered product unavailable and
+   *  return its amount to the buyer's wallet — the order itself continues. */
+  onMarkItemUnavailable?: (orderId: string, itemIndex: number) => void;
+  /** Loss prevention: send the buyer a Price Adjustment Quote (new farmgate
+   *  × 1.10) when farmers ask above the fixed buyer market price. */
+  onSendPriceQuote?: (orderId: string, quote: PriceAdjustmentQuote) => void;
   onUpdateTransportJobStatus?: (jobId: string, status: TransportJob['status']) => void;
   onAcceptTransportJob?: (jobId: string) => void;
   onAdminLogin: (adminUser: UserProfile) => void;
@@ -160,6 +183,8 @@ export const AdminApp: React.FC<AdminAppProps> = ({
   onBuyFarmerProduct,
   onPutInSupermarketStock,
   onUpdateOrderStatus,
+  onMarkItemUnavailable,
+  onSendPriceQuote,
   onUpdateTransportJobStatus,
   onAcceptTransportJob,
   onAdminLogin,
@@ -170,6 +195,9 @@ export const AdminApp: React.FC<AdminAppProps> = ({
 }) => {
   // Mobile hardware clock
   const [currentTime, setCurrentTime] = useState<string>('09:41');
+  // Price Adjustment Quote draft — opened when fulfillment is blocked because
+  // a farmer asks above the fixed buyer market price (loss prevention).
+  const [quoteDraft, setQuoteDraft] = useState<{ order: Order; quote: PriceAdjustmentQuote } | null>(null);
   useEffect(() => {
     const updateTime = () => {
       const now = new Date();
@@ -278,8 +306,11 @@ export const AdminApp: React.FC<AdminAppProps> = ({
   // Listen to live appSync sync events across tabs
   useEffect(() => {
     const unsub = appSync.subscribe('ORDERS_UPDATED', (payload) => {
-      if (payload.data && payload.data.id) {
-        const order = payload.data as Order;
+      // Only announce NEW orders: the payload must carry the full order
+      // (buyerName + items). Partial updates (e.g. {id, priceQuotes} after a
+      // Price Adjustment Quote is sent) must not fire the "new order" toast.
+      const order = payload.data as Order;
+      if (order && order.id && order.buyerName && Array.isArray(order.items)) {
         const isBuyerOrder =
           order.buyerId !== 'admin-main' &&
           !order.id.startsWith('TX-ADM-') &&
@@ -345,9 +376,13 @@ export const AdminApp: React.FC<AdminAppProps> = ({
   // Search and filter states
   const [userSearch, setUserSearch] = useState('');
   const [roleFilter, setRoleFilter] = useState<'all' | 'farmer' | 'buyer' | 'suspended'>('all');
+  // DA verification queue: the user currently previewed in the View Documents modal.
+  const [verificationUser, setVerificationUser] = useState<UserProfile | null>(null);
   const [produceSearch, setProduceSearch] = useState('');
   const [transactionSearch, setTransactionSearch] = useState('');
   const [transactionStatusFilter, setTransactionStatusFilter] = useState<'all' | 'completed' | 'delivered' | 'in_transit' | 'pending' | 'cancelled'>('all');
+  // ALL LEDGER date category: 'all' or a local YYYY-MM-DD day key.
+  const [ledgerDateFilter, setLedgerDateFilter] = useState<string>('all');
   const [haulFilter, setHaulFilter] = useState<'active' | 'in_transit' | 'delivered' | 'cancelled' | 'all'>('active');
 
   // DA Bantay Presyo search & live state
@@ -720,6 +755,11 @@ export const AdminApp: React.FC<AdminAppProps> = ({
   const [userToDelete, setUserToDelete] = useState<UserProfile | null>(null);
   const [produceToDelete, setProduceToDelete] = useState<ProduceItem | null>(null);
   const [boughtStockToDelete, setBoughtStockToDelete] = useState<any | null>(null);
+  // Warehouse Stocks menu: the aggregate crop card pending deletion (deleting
+  // removes EVERY produce record behind the crop's shelf stock).
+  const [warehouseStockToDelete, setWarehouseStockToDelete] = useState<
+    { name: string; unit: string; stockQuantity: number; linkedProduceIds: string[] } | null
+  >(null);
   const [buyingProduceItem, setBuyingProduceItem] = useState<ProduceItem | null>(null);
   const [buyQty, setBuyQty] = useState<number>(0);
   const [produceSubTab, setProduceSubTab] = useState<'supermarket' | 'farmer_offers'>('farmer_offers');
@@ -1056,6 +1096,22 @@ export const AdminApp: React.FC<AdminAppProps> = ({
       );
     });
   }, [registeredUsers, roleFilter, userSearch]);
+
+  // ── DA Admin Console · Pending User Verifications queue ─────────────────
+  // Newly registered Farmers & Buyers with verification_status = 'Pending'.
+  const pendingVerifications = useMemo(() => {
+    return registeredUsers
+      .filter(
+        (u) =>
+          (u.role === 'farmer' || u.role === 'buyer') &&
+          verificationStateOf(u) === 'Pending'
+      )
+      .sort((a, b) => {
+        const ta = a.submittedAt ? new Date(a.submittedAt).getTime() : 0;
+        const tb = b.submittedAt ? new Date(b.submittedAt).getTime() : 0;
+        return tb - ta; // newest registration first
+      });
+  }, [registeredUsers]);
 
   // Filtered Produce List
   const filteredProduce = useMemo(() => {
@@ -1712,16 +1768,29 @@ export const AdminApp: React.FC<AdminAppProps> = ({
           linkedProduceIds: [prod.id],
         };
       } else {
-        records[cropKey].stockQuantity = Math.max(records[cropKey].stockQuantity, prod.stockQuantity || 0);
+        // SUM across the warehouse records of this crop (multiple stocking
+        // lots are one pool on the shelf). Math.max used to hide deductions
+        // that landed on a smaller record — the menu kept showing the big
+        // lot's quantity after a sale.
+        records[cropKey].stockQuantity = records[cropKey].stockQuantity + (prod.stockQuantity || 0);
         if (!records[cropKey].linkedProduceIds.includes(prod.id)) {
           records[cropKey].linkedProduceIds.push(prod.id);
         }
       }
     });
 
-    // Also include any procured orders delivered to warehouse
+    // Safety net for legacy data: completed supermarket procurement orders
+    // that never materialized a warehouse record still surface here so the
+    // crop shows up in the Stocks menu. The backend backfills these into real
+    // records at startup (backfillProcurementWarehouseStock), so this branch
+    // only fires for data the backend hasn't processed yet. Orders the
+    // backend already materialized (warehouseStockAdded === true) are SKIPPED
+    // — their stock lives in real produce records, and when the admin deletes
+    // those records the crop must fully disappear from this menu instead of
+    // being resurrected by this fallback.
     orders.forEach((ord) => {
-      if (ord.status === 'cancelled') return;
+      if (ord.status !== 'completed') return;
+      if ((ord as any).warehouseStockAdded === true) return;
       const isAdminProcurement =
         ord.id.startsWith('TX-ADM-') ||
         ord.buyerId === 'admin-main' ||
@@ -1899,6 +1968,82 @@ export const AdminApp: React.FC<AdminAppProps> = ({
     });
   }, [transactionsList, transactionSearch, transactionStatusFilter]);
 
+  // ===== ALL LEDGER: DATE CATEGORY + FARMER/BUYER CATEGORISATION =====
+  // Buyer transactions = produce sold TO buyer users (money IN — sales).
+  // Farmer transactions = admin procurements FROM farmer users (money OUT — farm-gate cost).
+  const ledgerDateKeys = useMemo(() => {
+    const keys = new Set<string>();
+    transactionsList.forEach((tx) => keys.add(getOrderDateKey(tx.order.createdAt)));
+    return sortDateKeysDesc([...keys]);
+  }, [transactionsList]);
+
+  const ledgerDateCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    transactionsList.forEach((tx) => {
+      const key = getOrderDateKey(tx.order.createdAt);
+      counts[key] = (counts[key] || 0) + 1;
+    });
+    return counts;
+  }, [transactionsList]);
+
+  // Totals for the selected date (or All Dates). Cancelled transactions are
+  // excluded from the money totals — they never exchanged produce or cash.
+  const ledgerSummary = useMemo(() => {
+    const inScope =
+      ledgerDateFilter === 'all'
+        ? transactionsList
+        : transactionsList.filter((tx) => getOrderDateKey(tx.order.createdAt) === ledgerDateFilter);
+    const buyerTxs = inScope.filter((tx) => !isFarmerProcurementOrder(tx.order));
+    const farmerTxs = inScope.filter((tx) => isFarmerProcurementOrder(tx.order));
+    const sales = buyerTxs
+      .filter((tx) => tx.order.status !== 'cancelled')
+      .reduce((s, tx) => s + orderAmount(tx.order), 0);
+    const cost = farmerTxs
+      .filter((tx) => tx.order.status !== 'cancelled')
+      .reduce((s, tx) => s + orderFarmgateCost(tx.order), 0);
+    return {
+      label: ledgerDateFilter === 'all' ? 'All Dates' : formatDateKeyLabel(ledgerDateFilter),
+      buyerSales: sales,
+      buyerCount: buyerTxs.length,
+      farmerCost: cost,
+      farmerCount: farmerTxs.length,
+      margin: sales - cost,
+    };
+  }, [transactionsList, ledgerDateFilter]);
+
+  // Transactions grouped per date and split into the two user categories.
+  // Each group carries its own per-date sales / cost subtotals.
+  const ledgerGroups = useMemo(() => {
+    const scoped =
+      ledgerDateFilter === 'all'
+        ? filteredTransactions
+        : filteredTransactions.filter(
+            (tx) => getOrderDateKey(tx.order.createdAt) === ledgerDateFilter
+          );
+    const byDate = new globalThis.Map<string, typeof scoped>();
+    scoped.forEach((tx) => {
+      const key = getOrderDateKey(tx.order.createdAt);
+      if (!byDate.has(key)) byDate.set(key, []);
+      byDate.get(key)!.push(tx);
+    });
+    return sortDateKeysDesc([...byDate.keys()]).map((key) => {
+      const txs = byDate.get(key)!;
+      const buyerTxs = txs.filter((tx) => !isFarmerProcurementOrder(tx.order));
+      const farmerTxs = txs.filter((tx) => isFarmerProcurementOrder(tx.order));
+      return {
+        key,
+        buyerTxs,
+        farmerTxs,
+        buyerSales: buyerTxs
+          .filter((tx) => tx.order.status !== 'cancelled')
+          .reduce((s, tx) => s + orderAmount(tx.order), 0),
+        farmerCost: farmerTxs
+          .filter((tx) => tx.order.status !== 'cancelled')
+          .reduce((s, tx) => s + orderFarmgateCost(tx.order), 0),
+      };
+    });
+  }, [filteredTransactions, ledgerDateFilter]);
+
   // User Actions
   const handleToggleVerified = (user: UserProfile) => {
     const updated: UserProfile = {
@@ -1919,6 +2064,26 @@ export const AdminApp: React.FC<AdminAppProps> = ({
     onUpdateUser(updated);
     appSync.publish('USERS_UPDATED', updated, 'admin');
     showToast(`Account set to ${nextStatus.toUpperCase()}`);
+  };
+
+  // ── DA verification decisions ──────────────────────────────────────────
+  // Approve sets verification_status = 'Approved' (and the legacy verified
+  // flag) which unlocks full app features; Reject keeps the account locked
+  // out of selling / ordering.
+  const handleVerificationDecision = (user: UserProfile, decision: VerificationStatus) => {
+    const updated: UserProfile = {
+      ...user,
+      verificationStatus: decision,
+      verified: decision === 'Approved',
+    };
+    onUpdateUser(updated);
+    appSync.publish('USERS_UPDATED', updated, 'admin');
+    setVerificationUser(null);
+    showToast(
+      decision === 'Approved'
+        ? `${user.name} approved — they can now log in and trade`
+        : `${user.name}'s registration was rejected — they cannot log in`
+    );
   };
 
   const handleSaveUserEdit = (e: React.FormEvent) => {
@@ -2023,33 +2188,130 @@ export const AdminApp: React.FC<AdminAppProps> = ({
     );
   };
 
-  const handleFulfillBuyerRequest = (order: Order) => {
-    // Stock pre-check: every REQUEST lot item must still fit within
-    // warehouse stock before fulfillment (the server deducts & guards too).
-    const problems: string[] = [];
-    order.items?.forEach((item) => {
-      if (!isRequestLotItem(item.produceId)) return;
-      const target = findWarehouseTarget(item);
-      if (target) {
-        const available = target.stockQuantity || 0;
-        const needed = item.quantity || 1;
-        if (needed > available) {
-          problems.push(`${item.produceName}: needs ${needed}${item.unit || 'kg'}, only ${available}${target.unit || 'kg'} left`);
+  // ── Multi-farmer sourcing plan (client mirror of the server engine) ────────
+  // For each request-lot line: warehouse shelf first (already paid for), then
+  // farmer harvest lots sorted by farmgate price ASC, allocated sequentially.
+  // Buyer prices are FIXED per commodity (DA direct × 1.10) — farmer asking
+  // prices only move the admin's margin, never the buyer's price.
+  const computeOrderSourcing = useCallback(
+    (order: Order) => {
+      const lines: { item: Order['items'][number]; plan: SourcingPlanLine }[] = [];
+      for (const item of order.items || []) {
+        if (!isRequestLotItem(item.produceId)) continue;
+        const qty = Number(item.quantity) || 0;
+        const name = String(item.produceName || '').trim();
+        if (qty <= 0 || !name) continue;
+
+        const warehouseCandidates = produceList.filter(
+          (p) => isWarehouseOwnedRecord(p) && isMatchingCrop(p.name, name)
+        );
+        const wh = warehouseCandidates.sort(
+          (a, b) => (Number(b.stockQuantity) || 0) - (Number(a.stockQuantity) || 0)
+        )[0];
+        const warehouseLots: SourcingLot[] = [];
+        if (wh && (Number(wh.stockQuantity) || 0) > 0) {
+          warehouseLots.push({
+            id: wh.id,
+            cropName: name,
+            farmgatePrice: Number(wh.farmgateAskingPrice) || Number(wh.pricePerUnit) || 0,
+            availableQty: Math.floor(Number(wh.stockQuantity) || 0),
+            isWarehouse: true,
+            farmerName: 'VeggieConnect Warehouse',
+            farmName: 'VeggieConnect Supermarket',
+          });
         }
+        const farmerLots: SourcingLot[] = produceList
+          .filter(
+            (p) => !isWarehouseOwnedRecord(p) && (Number(p.stockQuantity) || 0) > 0 && isMatchingCrop(p.name, name)
+          )
+          .map((p) => ({
+            id: p.id,
+            cropName: p.name || name,
+            farmgatePrice: Number(p.farmgateAskingPrice ?? p.pricePerUnit) || 0,
+            availableQty: Math.floor(Number(p.stockQuantity) || 0),
+            farmerId: p.farmerId,
+            farmerName: p.farmerName,
+            farmName: p.farmName,
+            imageUrl: p.imageUrl,
+          }));
+
+        // The buyer's actual per-kg charge governs margin checks (DA-anchored
+        // fixed price, or an approved Price Adjustment Quote price).
+        const lineBuyerPrice = Math.round((Number(item.unitPrice ?? item.pricePerUnit) || 0) * 100) / 100;
+        const plan = buildSourcingPlan(name, qty, warehouseLots, farmerLots, lineBuyerPrice > 0 ? lineBuyerPrice : undefined);
+        lines.push({ item, plan });
       }
-    });
-    if (problems.length > 0) {
-      showToast(`⚠️ Cannot fulfill #${order.id} — ${problems.join(' • ')}. Restock the warehouse or decline this request.`);
+
+      const blocked = lines.some((l) => l.plan.blocked);
+      const shortfallQty = lines.reduce((s, l) => s + l.plan.shortfallQty, 0);
+      const totalFarmerCost = Math.round(lines.reduce((s, l) => s + l.plan.totalFarmerCost, 0) * 100) / 100;
+      const totalBuyerRevenue = Math.round(lines.reduce((s, l) => s + l.plan.buyerPrice * l.plan.totalQty, 0) * 100) / 100;
+      const farmerQty = lines.reduce(
+        (s, l) => s + l.plan.allocations.filter((a) => !a.isWarehouse).reduce((x, a) => x + a.quantity, 0),
+        0
+      );
+      const weightedAvgSourcingCost = farmerQty > 0 ? Math.round((totalFarmerCost / farmerQty) * 100) / 100 : 0;
+      const netAdminProfit = Math.round((totalBuyerRevenue - totalFarmerCost) * 100) / 100;
+      const lowMarginCount = lines.reduce((s, l) => s + l.plan.lowMarginWarnings.length, 0);
+      return {
+        lines,
+        hasLots: lines.length > 0,
+        blocked,
+        shortfallQty,
+        totalFarmerCost,
+        totalBuyerRevenue,
+        weightedAvgSourcingCost,
+        netAdminProfit,
+        lowMarginCount,
+      };
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [produceList, orders]
+  );
+
+  const handleFulfillBuyerRequest = (order: Order) => {
+    // Sourcing plan gate: the plan mirrors the server exactly — warehouse
+    // stock first, then cheapest farmer lots. Guardrails:
+    //   • a farmer asking above the fixed buyer price → LOSS — block and open
+    //     the Price Adjustment Quote flow (new farmgate × 1.10) for the buyer.
+    //   • market + farmers together cannot cover the quantity → shortfall.
+    const sourcing = computeOrderSourcing(order);
+    if (sourcing.hasLots && sourcing.blocked) {
+      const blockedLine = sourcing.lines.find((l) => l.plan.blocked)!;
+      const risk = blockedLine.plan.lossRisks[0];
+      const quote: PriceAdjustmentQuote = {
+        id: `paq-${Date.now()}-${Math.floor(Math.random() * 900 + 100)}`,
+        cropName: blockedLine.plan.cropName,
+        currentBuyerPrice: blockedLine.plan.buyerPrice,
+        proposedFarmgatePrice: risk.farmgatePrice,
+        proposedBuyerPrice: Math.round(risk.farmgatePrice * 1.1 * 100) / 100,
+        reason: `Supply shortage: ${risk.farmerName} asks ₱${risk.farmgatePrice.toFixed(2)}/kg but the fixed buyer price is ₱${blockedLine.plan.buyerPrice.toFixed(2)}/kg. Approve the adjusted price so the Admin can buy from the farmer and fulfil your order.`,
+        status: 'pending',
+        createdAt: new Date().toISOString(),
+      };
+      setQuoteDraft({ order, quote });
+      return;
+    }
+    if (sourcing.hasLots && sourcing.shortfallQty > 0) {
+      showToast(
+        `⚠️ Cannot fulfil #${order.id} — market shelf + farmer listings cover ${sourcing.lines.reduce((s, l) => s + l.plan.totalQty, 0)} kg but the request needs more (short by ${sourcing.shortfallQty} kg). Source more stock or mark the item unavailable.`
+      );
       return;
     }
 
     // Mark order status as confirmed (Fulfilled - ready for depot pickup or
     // delivery). App.handleUpdateOrderStatus performs the single request-lot
-    // warehouse deduction for this transition (visual + server authoritative).
+    // deduction for this transition; the server runs this same sourcing plan
+    // authoritatively and stores the allocations, weighted sourcing cost and
+    // net admin profit on the order.
     if (onUpdateOrderStatus) {
       onUpdateOrderStatus(order.id, 'confirmed');
     }
-    showToast(`✅ Fulfilled Buyer Request #${order.id}! Warehouse stocks deducted & Buyer notified.`);
+    showToast(
+      sourcing.hasLots && sourcing.weightedAvgSourcingCost > 0
+        ? `✅ Fulfilled #${order.id} — sourcing cost ₱${sourcing.totalFarmerCost.toFixed(2)} (avg ₱${sourcing.weightedAvgSourcingCost.toFixed(2)}/kg), net profit ₱${sourcing.netAdminProfit.toFixed(2)}.`
+        : `✅ Fulfilled Buyer Request #${order.id}! Warehouse stocks deducted & Buyer notified.`
+    );
   };
 
   const handleDeleteBoughtStock = (stock: any) => {
@@ -2064,8 +2326,63 @@ export const AdminApp: React.FC<AdminAppProps> = ({
     showToast(`Removed "${stock.name || 'item'}" from inventory records.`);
   };
 
+  // Warehouse Stocks menu delete: a warehouse crop card can aggregate several
+  // stocking lots (linkedProduceIds). Deleting the product removes EVERY
+  // linked record (local list + backend DELETE each), so the crop fully
+  // disappears from the Stocks menu, the Market shelf and buyer carts.
+  const handleDeleteWarehouseStock = () => {
+    if (!warehouseStockToDelete || !onDeleteProduce) return;
+    const ids =
+      warehouseStockToDelete.linkedProduceIds && warehouseStockToDelete.linkedProduceIds.length > 0
+        ? warehouseStockToDelete.linkedProduceIds
+        : [];
+    ids.forEach((id) => onDeleteProduce(id));
+    setWarehouseStockToDelete(null);
+    showToast(
+      ids.length > 1
+        ? `Removed "${warehouseStockToDelete.name}" (${ids.length} stock lots) from Warehouse Stocks.`
+        : `Removed "${warehouseStockToDelete.name}" from Warehouse Stocks.`
+    );
+  };
+
   // Owner Live Transport Actions
   const handleAdvanceTransportJob = (job: TransportJob, nextStatus: TransportJob['status']) => {
+    // ── Farmer confirmation gate ────────────────────────────────────────────
+    // The live transaction only starts after the supplying farmer CONFIRMED
+    // the order in their own Orders screen. A haul whose linked order is
+    // still 'pending' cannot be started by the owner.
+    const linkedOrderForGate = orders.find(
+      (o) => o.id === job.orderId || o.transportJobId === job.id
+    );
+    if (linkedOrderForGate && linkedOrderForGate.status === 'pending') {
+      showToast(
+        `⏳ Awaiting farmer confirmation — ${job.pickupFarm || 'the farm'} has not confirmed this order yet, so the live transport cannot start.`
+      );
+      return;
+    }
+
+    // ── Buyer payment gate ─────────────────────────────────────────────
+    // Buyer orders must be PAID from the buyer's VeggieConnect Pay wallet
+    // before the live transaction may start. Flow: admin approves → buyer
+    // pays in Orders ▸ Pay Now → live transport begins.
+    const gateIsBuyerOrder =
+      linkedOrderForGate &&
+      linkedOrderForGate.buyerId &&
+      linkedOrderForGate.buyerId !== 'admin-main' &&
+      !String(linkedOrderForGate.id || '').startsWith('TX-ADM-') &&
+      !(linkedOrderForGate.buyerName || '').toLowerCase().includes('admin');
+    if (
+      linkedOrderForGate &&
+      gateIsBuyerOrder &&
+      linkedOrderForGate.paymentStatus !== 'paid' &&
+      ['accepted', 'picked_up', 'in_transit', 'delivered'].includes(nextStatus)
+    ) {
+      showToast(
+        `💰 Buyer payment required — ${linkedOrderForGate.buyerName || 'the buyer'} has not paid for order #${linkedOrderForGate.id} yet. The live transport starts only after the buyer pays from their Wallet.`
+      );
+      return;
+    }
+
     if (onUpdateTransportJobStatus) {
       onUpdateTransportJobStatus(job.id, nextStatus);
     } else {
@@ -2105,9 +2422,9 @@ export const AdminApp: React.FC<AdminAppProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col items-center justify-center p-0 sm:p-4 selection:bg-emerald-600 selection:text-white">
+    <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col items-center justify-center p-0 min-[460px]:p-4 selection:bg-emerald-600 selection:text-white">
       {/* Pure Mobile App Shell */}
-      <div className="w-full max-w-[430px] h-[100dvh] sm:h-[min(920px,calc(100dvh_-_2rem))] bg-white sm:rounded-[44px] sm:border-[10px] sm:border-neutral-800/10 sm:shadow-[0_20px_50px_rgba(0,0,0,0.12)] relative flex flex-col overflow-hidden">
+      <div className="w-full max-w-[430px] h-[100dvh] min-[460px]:h-[min(920px,calc(100dvh_-_2rem))] bg-white min-[460px]:rounded-[44px] min-[460px]:border-[10px] min-[460px]:border-neutral-800/10 min-[460px]:shadow-[0_20px_50px_rgba(0,0,0,0.12)] relative flex flex-col overflow-hidden">
         {/* Toast Notification */}
         {toastMsg && (
           <div className="absolute top-14 left-1/2 -translate-x-1/2 z-50 bg-emerald-700 text-white font-bold px-4 py-2 rounded-full text-xs shadow-xl flex items-center gap-2 animate-in fade-in slide-in-from-top-3">
@@ -2551,6 +2868,136 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                     <p className="text-[10px] text-neutral-500">Manage growers, buyers, and active permissions</p>
                   </div>
 
+                  {/* ── PENDING USER VERIFICATIONS (DA Admin queue) ── */}
+                  <div
+                    className={`rounded-3xl border p-3 space-y-2.5 ${
+                      pendingVerifications.length > 0
+                        ? 'border-amber-300 bg-amber-50/70'
+                        : 'border-neutral-200 bg-neutral-50'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <h4 className="text-xs font-black text-neutral-900 flex items-center gap-1.5">
+                        <IdCard className="w-4 h-4 text-amber-600" />
+                        Pending User Verifications
+                      </h4>
+                      <span
+                        className={`text-[10px] font-black px-2 py-0.5 rounded-full ${
+                          pendingVerifications.length > 0
+                            ? 'bg-amber-500 text-white'
+                            : 'bg-neutral-200 text-neutral-500'
+                        }`}
+                      >
+                        {pendingVerifications.length} waiting
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-neutral-600">
+                      New Farmer &amp; Buyer registrations awaiting DA approval — the Admin reviews their documents (Valid Government ID, RSBSA / Business Proof) before they can log in.
+                    </p>
+
+                    {pendingVerifications.length === 0 ? (
+                      <div className="rounded-2xl border border-dashed border-neutral-300 bg-white p-4 text-center text-[11px] text-neutral-500">
+                        No pending registrations — every account has been reviewed.
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        {pendingVerifications.map((u) => {
+                          const isFarmerPending = u.role === 'farmer';
+                          const rsbsaProvided = Boolean(u.rsbsaNumber && u.rsbsaNumber.trim());
+                          const businessProofProvided = Boolean(
+                            u.businessProofImage && typeof u.businessProofImage === 'string' && u.businessProofImage.startsWith('data:image')
+                          );
+                          return (
+                            <div
+                              key={u.id}
+                              className="bg-white border border-neutral-200 rounded-2xl p-3 space-y-2 shadow-xs"
+                            >
+                              <div className="flex items-start justify-between gap-2">
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <div
+                                    className={`w-9 h-9 rounded-2xl flex items-center justify-center font-bold text-xs flex-shrink-0 border ${
+                                      isFarmerPending
+                                        ? 'bg-emerald-100 text-emerald-900 border-emerald-200'
+                                        : 'bg-sky-100 text-sky-900 border-sky-200'
+                                    }`}
+                                  >
+                                    {u.name.charAt(0)}
+                                  </div>
+                                  <div className="min-w-0">
+                                    <h5 className="font-bold text-xs text-neutral-900 truncate">{u.name}</h5>
+                                    <p className="text-[10px] text-neutral-500 font-mono truncate">{u.phone}</p>
+                                    {isFarmerPending && u.farmName && (
+                                      <p className="text-[10px] text-emerald-700 font-bold truncate">🌱 {u.farmName}</p>
+                                    )}
+                                  </div>
+                                </div>
+                                <span
+                                  className={`text-[9px] font-black px-2 py-0.5 rounded-full uppercase flex-shrink-0 ${
+                                    isFarmerPending ? 'bg-emerald-100 text-emerald-800' : 'bg-sky-100 text-sky-800'
+                                  }`}
+                                >
+                                  {u.role}
+                                </span>
+                              </div>
+
+                              {/* Automatic verification badges */}
+                              {(rsbsaProvided || businessProofProvided || u.location) && (
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  {isFarmerPending && rsbsaProvided && (
+                                    <span className="text-[9px] font-black px-2 py-0.5 rounded-full bg-emerald-700 text-white flex items-center gap-1">
+                                      <BadgeCheck className="w-3 h-3" /> DA Registered
+                                    </span>
+                                  )}
+                                  {!isFarmerPending && businessProofProvided && (
+                                    <span className="text-[9px] font-black px-2 py-0.5 rounded-full bg-sky-700 text-white flex items-center gap-1">
+                                      <BadgeCheck className="w-3 h-3" /> Verified Business
+                                    </span>
+                                  )}
+                                  <span className="text-[9px] font-bold text-neutral-500 flex items-center gap-1 truncate">
+                                    <MapPin className="w-3 h-3 text-neutral-400 flex-shrink-0" />
+                                    <span className="truncate">{u.location}</span>
+                                  </span>
+                                </div>
+                              )}
+
+                              <div className="flex items-center gap-1.5 pt-1.5 border-t border-neutral-100">
+                                <button
+                                  type="button"
+                                  id={`btn-view-documents-${u.id}`}
+                                  onClick={() => setVerificationUser(u)}
+                                  className="flex-1 px-2.5 py-1.5 rounded-xl bg-neutral-900 hover:bg-neutral-800 text-white text-[10px] font-black flex items-center justify-center gap-1 cursor-pointer transition-colors"
+                                >
+                                  <Eye className="w-3.5 h-3.5" />
+                                  <span>View Documents</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  id={`btn-approve-${u.id}`}
+                                  onClick={() => handleVerificationDecision(u, 'Approved')}
+                                  className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-black flex items-center gap-1 cursor-pointer transition-colors"
+                                  title="Approve — unlocks selling & ordering"
+                                >
+                                  <Check className="w-3.5 h-3.5" />
+                                  <span>Approve</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  id={`btn-reject-${u.id}`}
+                                  onClick={() => handleVerificationDecision(u, 'Rejected')}
+                                  className="px-2.5 py-1.5 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-[10px] font-black flex items-center gap-1 cursor-pointer transition-colors"
+                                  title="Reject this registration"
+                                >
+                                  <ShieldX className="w-3.5 h-3.5" />
+                                  <span>Reject</span>
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
                   <div className="relative">
                     <Search className="w-4 h-4 text-neutral-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
                     <input
@@ -2688,6 +3135,29 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                   {isFarmer && u.farmName && (
                                     <p className="text-[11px] text-emerald-700 font-bold truncate">🌱 {u.farmName}</p>
                                   )}
+                                  {/* DA verification state badges */}
+                                  <div className="flex items-center gap-1 flex-wrap mt-0.5">
+                                    {verificationStateOf(u) === 'Pending' && (
+                                      <span className="text-[8px] font-black px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 uppercase">
+                                        Pending Verification
+                                      </span>
+                                    )}
+                                    {verificationStateOf(u) === 'Rejected' && (
+                                      <span className="text-[8px] font-black px-1.5 py-0.5 rounded-full bg-rose-100 text-rose-700 border border-rose-300 uppercase">
+                                        Rejected
+                                      </span>
+                                    )}
+                                    {isFarmer && u.rsbsaNumber && u.rsbsaNumber.trim() && (
+                                      <span className="text-[8px] font-black px-1.5 py-0.5 rounded-full bg-emerald-700 text-white uppercase flex items-center gap-0.5">
+                                        <BadgeCheck className="w-2.5 h-2.5" /> DA Registered
+                                      </span>
+                                    )}
+                                    {!isFarmer && u.businessProofImage && String(u.businessProofImage).startsWith('data:image') && (
+                                      <span className="text-[8px] font-black px-1.5 py-0.5 rounded-full bg-sky-700 text-white uppercase flex items-center gap-0.5">
+                                        <BadgeCheck className="w-2.5 h-2.5" /> Verified Business
+                                      </span>
+                                    )}
+                                  </div>
                                 </div>
                               </div>
 
@@ -3170,14 +3640,33 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                 </div>
                               </div>
 
-                              <div className="text-right shrink-0">
-                                <span className="text-[9px] text-neutral-500 uppercase font-bold block">Available Stock:</span>
-                                <span className="text-base font-black text-emerald-900 font-mono">
-                                  {item.stockQuantity} {item.unit}s
-                                </span>
-                                <span className="text-[10px] text-neutral-500 block font-mono">
-                                  Cost: ₱{(Number(item.costPricePerUnit) || 0).toFixed(2)}/{item.unit}
-                                </span>
+                              <div className="text-right shrink-0 flex items-start gap-2">
+                                <div className="text-right">
+                                  <span className="text-[9px] text-neutral-500 uppercase font-bold block">Available Stock:</span>
+                                  <span className="text-base font-black text-emerald-900 font-mono">
+                                    {item.stockQuantity} {item.unit}s
+                                  </span>
+                                  <span className="text-[10px] text-neutral-500 block font-mono">
+                                    Cost: ₱{(Number(item.costPricePerUnit) || 0).toFixed(2)}/{item.unit}
+                                  </span>
+                                </div>
+                                {/* Delete Button: remove this product from the
+                                    Warehouse Stocks menu (all stocking lots). */}
+                                <button
+                                  id={`btn-delete-warehouse-stock-${item.id}`}
+                                  onClick={() =>
+                                    setWarehouseStockToDelete({
+                                      name: item.name,
+                                      unit: item.unit,
+                                      stockQuantity: item.stockQuantity,
+                                      linkedProduceIds: item.linkedProduceIds,
+                                    })
+                                  }
+                                  className="mt-0.5 p-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 hover:bg-rose-100 hover:text-rose-700 transition-all active:scale-90 cursor-pointer"
+                                  title={`Delete ${item.name} from Warehouse Stocks`}
+                                >
+                                  <Trash2 className="w-4 h-4" />
+                                </button>
                               </div>
                             </div>
 
@@ -3408,11 +3897,28 @@ export const AdminApp: React.FC<AdminAppProps> = ({
 
                                       <div className="text-right">
                                         <span className="text-sm font-black text-emerald-800 bg-emerald-50 px-2.5 py-1 rounded-xl border border-emerald-200 block font-mono">
-                                          ₱{(Number(order?.totalAmount ?? order?.subtotal) || 0).toFixed(2)}
+                                          {order.paymentStatus === 'paid'
+                                            ? `₱${(Number(order.paidAmount ?? (Number(order.totalAmount ?? order.subtotal) || 0) - (Number(order.refundedTotal) || 0)) || 0).toFixed(2)}`
+                                            : `₱${(Number(order?.totalAmount ?? order?.subtotal) || 0).toFixed(2)}`}
                                         </span>
-                                        <span className="text-[9px] text-neutral-500 font-bold block mt-0.5">
-                                          Over-the-Counter Cash
-                                        </span>
+                                        {Number(order.refundedTotal) > 0 && (
+                                          <span className="text-[9px] text-red-600 font-bold block mt-0.5">
+                                            −₱{Number(order.refundedTotal).toFixed(2)} refunded
+                                          </span>
+                                        )}
+                                        {order.paymentStatus === 'paid' ? (
+                                          <span className="text-[9px] font-black text-emerald-800 bg-emerald-100 border border-emerald-300 rounded-full px-2 py-0.5 mt-1 inline-block">
+                                            PAID ✓ WALLET
+                                          </span>
+                                        ) : isPending ? (
+                                          <span className="text-[9px] text-neutral-500 font-bold block mt-0.5">
+                                            Unpaid — pays after approval
+                                          </span>
+                                        ) : (
+                                          <span className="text-[9px] font-black text-amber-800 bg-amber-100 border border-amber-300 rounded-full px-2 py-0.5 mt-1 inline-block animate-pulse">
+                                            AWAITING BUYER PAYMENT
+                                          </span>
+                                        )}
                                       </div>
                                     </div>
 
@@ -3505,6 +4011,36 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                                   <span>Locate in Stocks →</span>
                                                 </button>
                                               </div>
+
+                                              {/* Availability ruling: return this product's amount
+                                                  to the buyer and continue the order WITHOUT it.
+                                                  Paid orders credit the buyer's wallet instantly;
+                                                  unpaid orders simply drop the amount from the bill. */}
+                                              {item.itemStatus === 'unavailable' ? (
+                                                <div className="bg-red-50 border border-red-200 rounded-lg px-2 py-1 text-[10px] font-bold text-red-700 flex items-center gap-1">
+                                                  <XCircle className="w-3 h-3 text-red-600" />
+                                                  <span>
+                                                    Unavailable — ₱{Number(item.refundedAmount || 0).toFixed(2)}
+                                                    {order.paymentStatus === 'paid' ? ' refunded to buyer wallet' : ' removed from the bill'}.
+                                                    Order continues with the rest.
+                                                  </span>
+                                                </div>
+                                              ) : (
+                                                !isCancelled && !isCompleted && onMarkItemUnavailable && (
+                                                  <div className="flex justify-end">
+                                                    <button
+                                                      type="button"
+                                                      id={`btn-mark-unavailable-${order.id}-${idx}`}
+                                                      onClick={() => onMarkItemUnavailable(order.id, idx)}
+                                                      className="text-[10px] font-bold text-amber-700 hover:text-amber-900 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-lg px-2 py-1 flex items-center gap-1 cursor-pointer transition-colors"
+                                                      title="Mark unavailable: return this product's amount to the buyer — the order continues with the remaining products"
+                                                    >
+                                                      <AlertTriangle className="w-3 h-3" />
+                                                      <span>Mark Unavailable & Return Amount</span>
+                                                    </button>
+                                                  </div>
+                                                )
+                                              )}
                                             </div>
                                           );
                                         })}
@@ -3526,6 +4062,148 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                         </p>
                                       </div>
                                     )}
+
+                                    {/* ── Multi-Farmer Sourcing Plan & Margin Guardrails ──
+                                        Pending requests show HOW the order will be fulfilled:
+                                        warehouse shelf first, then farmer harvests sorted by
+                                        farmgate price ASC allocated sequentially. Buyer prices
+                                        stay FIXED per commodity (DA direct × 1.10); farmers with
+                                        <5% margin get a warning badge and loss-priced farmers
+                                        BLOCK fulfillment until a Price Adjustment Quote is
+                                        approved by the buyer. */}
+                                    {isPending && (() => {
+                                      const sourcing = computeOrderSourcing(order);
+                                      if (!sourcing.hasLots) return null;
+                                      return (
+                                        <div
+                                          id={`sourcing-plan-${order.id}`}
+                                          className="bg-gradient-to-b from-emerald-50/80 to-white border border-emerald-200 rounded-2xl p-3 space-y-2"
+                                        >
+                                          <div className="flex items-center justify-between">
+                                            <p className="text-[11px] font-black text-emerald-950 flex items-center gap-1.5">
+                                              <Layers className="w-3.5 h-3.5 text-emerald-700" />
+                                              Multi-Farmer Sourcing Plan
+                                            </p>
+                                            <span className="text-[9px] font-bold text-emerald-700 bg-emerald-100 border border-emerald-200 rounded-full px-2 py-0.5">
+                                              buyer price fixed (DA + 10%)
+                                            </span>
+                                          </div>
+
+                                          {sourcing.lines.map((line, li) => (
+                                            <div key={`${line.item.produceId}-${li}`} className="bg-white border border-emerald-100 rounded-xl p-2.5 space-y-1.5">
+                                              <div className="flex items-center justify-between gap-2">
+                                                <span className="text-[11px] font-extrabold text-neutral-900">
+                                                  {line.plan.cropName} — {line.plan.requestedQty} kg
+                                                </span>
+                                                <span className="text-[10px] font-bold text-emerald-800 font-mono">
+                                                  @₱{line.plan.buyerPrice.toFixed(2)}/kg
+                                                </span>
+                                              </div>
+
+                                              {line.plan.allocations.map((alloc, ai) => {
+                                                const marginPct =
+                                                  alloc.isWarehouse
+                                                    ? null
+                                                    : Math.round(((line.plan.buyerPrice - alloc.farmgatePrice) / (line.plan.buyerPrice || 1)) * 10000) / 100;
+                                                const isLoss = marginPct !== null && marginPct < 0;
+                                                const isLowMargin = marginPct !== null && !isLoss && marginPct < LOW_MARGIN_RATE * 100;
+                                                return (
+                                                  <div key={alloc.id || ai} className="flex items-center justify-between gap-2 text-[10px] bg-neutral-50 rounded-lg px-2 py-1">
+                                                    <span className="font-bold text-neutral-800 truncate">
+                                                      {alloc.quantity} kg @ ₱{alloc.farmgatePrice.toFixed(2)}/kg —{' '}
+                                                      {alloc.isWarehouse ? 'Warehouse shelf (already bought)' : alloc.farmerName || 'Farmer'}
+                                                    </span>
+                                                    {marginPct !== null && (
+                                                      <span
+                                                        className={`flex-shrink-0 font-black px-1.5 py-0.5 rounded-md border ${
+                                                          isLoss
+                                                            ? 'bg-red-100 text-red-700 border-red-300'
+                                                            : isLowMargin
+                                                              ? 'bg-amber-100 text-amber-800 border-amber-300'
+                                                              : 'bg-emerald-100 text-emerald-800 border-emerald-200'
+                                                        }`}
+                                                        title={
+                                                          isLoss
+                                                            ? 'Farmer asks above the fixed buyer price — fulfillment is blocked'
+                                                            : isLowMargin
+                                                              ? `Only ${marginPct.toFixed(1)}% margin (below the 5% guardrail)`
+                                                              : `${marginPct.toFixed(1)}% margin`
+                                                        }
+                                                      >
+                                                        {isLoss ? '⚠ LOSS' : isLowMargin ? `⚠ LOW ${marginPct.toFixed(1)}%` : `${marginPct.toFixed(1)}%`}
+                                                      </span>
+                                                    )}
+                                                  </div>
+                                                );
+                                              })}
+
+                                              {!line.plan.blocked && line.plan.shortfallQty > 0 && (
+                                                <p className="text-[10px] font-bold text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1">
+                                                  ⚠ Short by {line.plan.shortfallQty} kg — market shelf + farmer listings cannot cover the request yet.
+                                                </p>
+                                              )}
+                                            </div>
+                                          ))}
+
+                                          <div className="grid grid-cols-3 gap-1.5">
+                                            <div className="bg-white border border-neutral-200 rounded-lg px-2 py-1.5 text-center">
+                                              <p className="text-[9px] font-bold text-neutral-500 uppercase">Farmer Cost</p>
+                                              <p className="text-[11px] font-black text-amber-800">₱{sourcing.totalFarmerCost.toFixed(2)}</p>
+                                            </div>
+                                            <div className="bg-white border border-neutral-200 rounded-lg px-2 py-1.5 text-center">
+                                              <p className="text-[9px] font-bold text-neutral-500 uppercase">Weighted Avg</p>
+                                              <p className="text-[11px] font-black text-sky-800">
+                                                {sourcing.weightedAvgSourcingCost > 0 ? `₱${sourcing.weightedAvgSourcingCost.toFixed(2)}/kg` : '—'}
+                                              </p>
+                                            </div>
+                                            <div className="bg-white border border-neutral-200 rounded-lg px-2 py-1.5 text-center">
+                                              <p className="text-[9px] font-bold text-neutral-500 uppercase">Net Profit</p>
+                                              <p className={`text-[11px] font-black ${sourcing.netAdminProfit >= 0 ? 'text-emerald-800' : 'text-red-700'}`}>
+                                                ₱{sourcing.netAdminProfit.toFixed(2)}
+                                              </p>
+                                            </div>
+                                          </div>
+
+                                          {sourcing.blocked && (
+                                            <div className="bg-red-50 border border-red-300 rounded-xl p-2.5 space-y-1.5">
+                                              <p className="text-[10px] font-extrabold text-red-800 flex items-center gap-1">
+                                                <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
+                                                Loss prevention: a farmer asks above the fixed buyer price — fulfillment blocked.
+                                              </p>
+                                              <button
+                                                type="button"
+                                                id={`btn-send-quote-${order.id}`}
+                                                onClick={() => handleFulfillBuyerRequest(order)}
+                                                className="w-full min-h-[40px] rounded-xl bg-red-600 hover:bg-red-700 text-white text-[11px] font-black flex items-center justify-center gap-1.5 cursor-pointer active:scale-95 transition-all"
+                                              >
+                                                <Send className="w-3.5 h-3.5" />
+                                                <span>Send Price Adjustment Quote (farmgate × 1.10)</span>
+                                              </button>
+                                            </div>
+                                          )}
+
+                                          {(order.priceQuotes || []).length > 0 && (
+                                            <div className="space-y-1">
+                                              {order.priceQuotes!.map((q) => (
+                                                <div
+                                                  key={q.id}
+                                                  className={`text-[10px] font-bold rounded-lg px-2 py-1 border ${
+                                                    q.status === 'pending'
+                                                      ? 'bg-amber-50 border-amber-200 text-amber-900'
+                                                      : q.status === 'approved'
+                                                        ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                                                        : 'bg-neutral-100 border-neutral-200 text-neutral-600'
+                                                  }`}
+                                                >
+                                                  Quote · {q.cropName}: ₱{q.currentBuyerPrice.toFixed(2)} → ₱{q.proposedBuyerPrice.toFixed(2)}/kg ·{' '}
+                                                  {q.status === 'pending' ? 'waiting for buyer' : q.status.toUpperCase()}
+                                                </div>
+                                              ))}
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })()}
 
                                     {/* Action Buttons for Admin */}
                                     {!isCancelled && (
@@ -3560,15 +4238,25 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                             <button
                                               type="button"
                                               onClick={() => {
+                                                // Payment gate: the buyer pays from their VeggieConnect
+                                                // Pay wallet AFTER approval — completion requires payment.
+                                                if (order.paymentStatus !== 'paid') {
+                                                  showToast(
+                                                    `💰 Buyer hasn't paid yet — ${order.buyerName || 'the buyer'} must pay order #${order.id} from their Wallet (Orders ▸ Pay Now) before pickup & completion.`
+                                                  );
+                                                  return;
+                                                }
                                                 if (onUpdateOrderStatus) {
                                                   onUpdateOrderStatus(order.id, 'completed');
                                                 }
                                                 showToast(`🎉 Order #${order.id} marked completed. Payment received!`);
                                               }}
-                                              className="flex-1 py-2.5 px-3 bg-emerald-700 hover:bg-emerald-800 text-white rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-md cursor-pointer active:scale-95 transition-all"
+                                              className={`flex-1 py-2.5 px-3 ${order.paymentStatus === 'paid' ? 'bg-emerald-700 hover:bg-emerald-800' : 'bg-neutral-300 hover:bg-neutral-400 text-neutral-700'} text-white rounded-2xl text-xs font-extrabold flex items-center justify-center gap-1.5 shadow-md cursor-pointer active:scale-95 transition-all`}
                                             >
                                               <CheckCircle2 className="w-4 h-4" />
-                                              <span>Mark Picked Up & Paid</span>
+                                              <span>
+                                                {order.paymentStatus === 'paid' ? 'Mark Picked Up & Paid' : 'Awaiting Buyer Wallet Payment'}
+                                              </span>
                                             </button>
                                             <button
                                               type="button"
@@ -3729,6 +4417,11 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                               (t) => t.order.id === job.orderId || t.job?.id === job.id
                             );
                             const linkedOrder = matchingTx?.order || orders.find((o) => o.id === job.orderId || o.transportJobId === job.id);
+
+                            // FARMER CONFIRMATION GATE: the supplying farmer must confirm
+                            // the linked order before the owner can start the live transport.
+                            const isAwaitingFarmerConfirmation =
+                              !isCancelled && (linkedOrder?.status === 'pending' || (!linkedOrder && job.status === 'available' && (job as any).farmerConfirmationRequired === true));
 
                             // LIVE ROUTE: supermarket hub ➔ THIS haul's supplying farm (active hauls only).
                             const supplyItem = linkedOrder?.items?.[0];
@@ -3952,6 +4645,25 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                       </div>
                                     )}
                                   </div>
+                                ) : isAwaitingFarmerConfirmation ? (
+                                  /* FARMER CONFIRMATION GATE: the live transaction cannot
+                                     start until the supplying farmer confirms the order. */
+                                  <div className="bg-sky-50 border border-sky-200 rounded-2xl p-3 text-xs text-sky-900 space-y-1.5">
+                                    <div className="flex items-center justify-between font-bold">
+                                      <span className="flex items-center gap-1">
+                                        <Clock className="w-3.5 h-3.5 text-sky-600 animate-pulse" />
+                                        <span>Awaiting Farmer Confirmation</span>
+                                      </span>
+                                      <span className="text-[9px] font-black px-2 py-0.5 rounded-full uppercase bg-sky-100 text-sky-800 border border-sky-300">
+                                        Step 0 — Farmer
+                                      </span>
+                                    </div>
+                                    <p className="text-[11px] text-sky-800 leading-relaxed">
+                                      The farmer must confirm order <strong>#{job.orderId}</strong> in their own Orders
+                                      screen first. Once confirmed, your pickup route unlocks and the live transport
+                                      can begin.
+                                    </p>
+                                  </div>
                                 ) : (
                                   <div className="space-y-2 pt-1">
                                     {isAvailable && (
@@ -4100,22 +4812,228 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                         </button>
                       </div>
 
-                      {/* Transactions List */}
+                      {/* DATE CATEGORY CHIPS (All Ledger) */}
+                      <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1">
+                        <button
+                          id="chip-ledger-dates-all"
+                          onClick={() => setLedgerDateFilter('all')}
+                          className={`min-h-[36px] px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 transition-all cursor-pointer ${
+                            ledgerDateFilter === 'all'
+                              ? 'bg-emerald-700 text-white shadow-xs'
+                              : 'bg-white text-emerald-950 border border-neutral-200 hover:bg-neutral-50'
+                          }`}
+                        >
+                          <Calendar className="w-3.5 h-3.5" />
+                          <span>All Dates</span>
+                          <span
+                            className={`text-[9px] font-black px-1.5 py-0.5 rounded-full ${
+                              ledgerDateFilter === 'all' ? 'bg-white/20 text-white' : 'bg-emerald-100 text-emerald-800'
+                            }`}
+                          >
+                            {transactionsList.length}
+                          </span>
+                        </button>
+                        {ledgerDateKeys.map((key) => (
+                          <button
+                            key={key}
+                            id={`chip-ledger-date-${key}`}
+                            onClick={() => setLedgerDateFilter(key)}
+                            className={`min-h-[36px] px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 transition-all cursor-pointer ${
+                              ledgerDateFilter === key
+                                ? 'bg-emerald-700 text-white shadow-xs'
+                                : 'bg-white text-emerald-950 border border-neutral-200 hover:bg-neutral-50'
+                            }`}
+                          >
+                            <Calendar className="w-3.5 h-3.5" />
+                            <span>{formatDateKeyShort(key)}</span>
+                            <span
+                              className={`text-[9px] font-black px-1.5 py-0.5 rounded-full ${
+                                ledgerDateFilter === key ? 'bg-white/20 text-white' : 'bg-emerald-100 text-emerald-800'
+                              }`}
+                            >
+                              {ledgerDateCounts[key] || 0}
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+
+                      {/* DATE SUMMARY: BUYER SALES vs FARMER COST (All Ledger) */}
+                      {ledgerSummary && (
+                        <div
+                          id="ledger-date-summary"
+                          className="bg-white border border-neutral-200 rounded-3xl p-3.5 space-y-2.5 shadow-xs"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-extrabold uppercase tracking-wider text-neutral-600 flex items-center gap-1.5 min-w-0">
+                              <Calendar className="w-3.5 h-3.5 text-emerald-700 flex-shrink-0" />
+                              <span className="truncate">{ledgerSummary.label} — Transaction Categories</span>
+                            </span>
+                            <span className="text-[9px] font-bold bg-neutral-100 text-neutral-500 px-1.5 py-0.5 rounded-full whitespace-nowrap flex-shrink-0">
+                              Cancelled excluded
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2">
+                            {/* BUYER TRANSACTIONS — TOTAL SALES */}
+                            <div
+                              id="ledger-summary-buyer-sales"
+                              className="rounded-2xl bg-emerald-50 border border-emerald-200 p-2.5"
+                            >
+                              <div className="flex items-center gap-1.5 text-[10px] font-extrabold text-emerald-900 uppercase tracking-wide">
+                                <ShoppingBag className="w-3.5 h-3.5 text-emerald-700 flex-shrink-0" />
+                                <span>Buyer Transactions</span>
+                              </div>
+                              <p className="text-[9px] text-neutral-500 font-semibold mt-0.5">Total Sales (money in)</p>
+                              <p className="text-lg font-black text-emerald-800 font-mono leading-tight">
+                                ₱{ledgerSummary.buyerSales.toLocaleString('en-PH', { minimumFractionDigits: 2 })}
+                              </p>
+                              <p className="text-[10px] text-neutral-500 font-medium">
+                                {ledgerSummary.buyerCount} buyer transaction{ledgerSummary.buyerCount === 1 ? '' : 's'}
+                              </p>
+                            </div>
+                            {/* FARMER TRANSACTIONS — TOTAL COST */}
+                            <div
+                              id="ledger-summary-farmer-cost"
+                              className="rounded-2xl bg-amber-50 border border-amber-200 p-2.5"
+                            >
+                              <div className="flex items-center gap-1.5 text-[10px] font-extrabold text-amber-900 uppercase tracking-wide">
+                                <Sprout className="w-3.5 h-3.5 text-amber-700 flex-shrink-0" />
+                                <span>Farmer Transactions</span>
+                              </div>
+                              <p className="text-[9px] text-neutral-500 font-semibold mt-0.5">Total Cost (farm-gate payout)</p>
+                              <p className="text-lg font-black text-amber-800 font-mono leading-tight">
+                                ₱{ledgerSummary.farmerCost.toLocaleString('en-PH', { minimumFractionDigits: 2 })}
+                              </p>
+                              <p className="text-[10px] text-neutral-500 font-medium">
+                                {ledgerSummary.farmerCount} farmer transaction{ledgerSummary.farmerCount === 1 ? '' : 's'}
+                              </p>
+                            </div>
+                          </div>
+                          {/* Net margin for the selected date */}
+                          <div className="flex items-center justify-between bg-neutral-50 border border-neutral-200 rounded-2xl px-3 py-2">
+                            <span className="text-[10px] font-bold text-neutral-600 flex items-center gap-1.5">
+                              <Scale className="w-3.5 h-3.5 text-neutral-500 flex-shrink-0" />
+                              <span>Margin (Buyer Sales − Farmer Cost)</span>
+                            </span>
+                            <span
+                              className={`text-xs font-black font-mono ${
+                                ledgerSummary.margin >= 0 ? 'text-emerald-700' : 'text-red-600'
+                              }`}
+                            >
+                              ₱{ledgerSummary.margin.toFixed(2)}
+                            </span>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Transactions List — grouped by date, split by user category */}
                       <div className="space-y-3">
-                        {filteredTransactions.length === 0 ? (
+                        {ledgerGroups.length === 0 ? (
                           <div className="bg-white border border-neutral-200 rounded-3xl p-6 text-center text-xs text-neutral-500">
                             No transactions found matching your filter.
                           </div>
                         ) : (
-                          filteredTransactions.map((tx) => {
+                          (() => {
+                            type LedgerTxItem = (typeof transactionsList)[number];
+                            type LedgerGroupItem = (typeof ledgerGroups)[number];
+                            type LedgerPlanItem =
+                              | { kind: 'date'; key: string; group: LedgerGroupItem }
+                              | { kind: 'cat'; key: string; category: 'buyer' | 'farmer'; group: LedgerGroupItem }
+                              | { kind: 'tx'; key: string; tx: LedgerTxItem };
+                            const plan: LedgerPlanItem[] = [];
+                            ledgerGroups.forEach((group) => {
+                              plan.push({ kind: 'date', key: `date-${group.key}`, group });
+                              if (group.buyerTxs.length > 0) {
+                                plan.push({ kind: 'cat', key: `cat-buyer-${group.key}`, category: 'buyer', group });
+                                group.buyerTxs.forEach((tx) =>
+                                  plan.push({ kind: 'tx', key: `${tx.order.id}::buyer::${group.key}`, tx })
+                                );
+                              }
+                              if (group.farmerTxs.length > 0) {
+                                plan.push({ kind: 'cat', key: `cat-farmer-${group.key}`, category: 'farmer', group });
+                                group.farmerTxs.forEach((tx) =>
+                                  plan.push({ kind: 'tx', key: `${tx.order.id}::farmer::${group.key}`, tx })
+                                );
+                              }
+                            });
+                            return plan.map((item) => {
+                              if (item.kind === 'date') {
+                                const group = item.group;
+                                return (
+                                  <div
+                                    key={item.key}
+                                    id={`ledger-date-section-${group.key}`}
+                                    className="bg-gradient-to-r from-neutral-100 to-emerald-50 border border-neutral-200 rounded-2xl px-3 py-2.5 flex items-center justify-between gap-2"
+                                  >
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                      <Calendar className="w-4 h-4 text-emerald-700 flex-shrink-0" />
+                                      <div className="min-w-0">
+                                        <p className="text-xs font-extrabold text-neutral-900 truncate">
+                                          {formatDateKeyLabel(group.key)}
+                                        </p>
+                                        <p className="text-[10px] text-neutral-500 font-medium">
+                                          {group.buyerTxs.length} buyer · {group.farmerTxs.length} farmer transaction
+                                          {group.buyerTxs.length + group.farmerTxs.length === 1 ? '' : 's'}
+                                        </p>
+                                      </div>
+                                    </div>
+                                    <div className="flex items-center gap-1.5 flex-shrink-0 flex-wrap justify-end">
+                                      <span
+                                        id={`ledger-date-sales-${group.key}`}
+                                        className="text-[10px] font-extrabold text-emerald-800 bg-emerald-100/80 border border-emerald-200 px-2 py-0.5 rounded-lg whitespace-nowrap"
+                                      >
+                                        Sales: ₱{group.buyerSales.toFixed(2)}
+                                      </span>
+                                      <span
+                                        id={`ledger-date-cost-${group.key}`}
+                                        className="text-[10px] font-extrabold text-amber-800 bg-amber-100/80 border border-amber-200 px-2 py-0.5 rounded-lg whitespace-nowrap"
+                                      >
+                                        Cost: ₱{group.farmerCost.toFixed(2)}
+                                      </span>
+                                    </div>
+                                  </div>
+                                );
+                              }
+                              if (item.kind === 'cat') {
+                                const group = item.group;
+                                return (
+                                  <div key={item.key} className="flex items-center justify-between gap-2 px-1 pt-1">
+                                    <span
+                                      className={`text-[10px] font-extrabold uppercase tracking-wider flex items-center gap-1.5 ${
+                                        item.category === 'buyer' ? 'text-emerald-700' : 'text-amber-700'
+                                      }`}
+                                    >
+                                      {item.category === 'buyer' ? (
+                                        <ShoppingBag className="w-3.5 h-3.5 flex-shrink-0" />
+                                      ) : (
+                                        <Sprout className="w-3.5 h-3.5 flex-shrink-0" />
+                                      )}
+                                      <span>
+                                        {item.category === 'buyer'
+                                          ? 'Buyer Transactions (Sales)'
+                                          : 'Farmer Transactions (Cost)'}
+                                      </span>
+                                    </span>
+                                    <span
+                                      className={`text-[11px] font-black ${
+                                        item.category === 'buyer' ? 'text-emerald-800' : 'text-amber-800'
+                                      }`}
+                                    >
+                                      {item.category === 'buyer'
+                                        ? `₱${group.buyerSales.toFixed(2)}`
+                                        : `₱${group.farmerCost.toFixed(2)}`}
+                                    </span>
+                                  </div>
+                                );
+                              }
+                              const tx = item.tx;
                             const isDelivered = tx.order.status === 'completed' || tx.job?.status === 'delivered';
                             const isInTransit = tx.order.status === 'in_transit' || tx.job?.status === 'in_transit';
                             const isPickedUp = tx.order.status === 'picked_up' || tx.job?.status === 'picked_up';
                             const isAccepted = tx.job?.status === 'accepted';
 
                             return (
+                              <React.Fragment key={item.key}>
                               <div
-                                key={tx.order.id}
                                 className="bg-white border border-neutral-200/90 rounded-3xl p-4 space-y-3 shadow-xs"
                               >
                                 {/* Header: Transaction ID, Timestamp, Status */}
@@ -4212,6 +5130,53 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                   </div>
                                 </div>
 
+                                {/* ── Multi-Farmer Sourcing & Margin (fulfilled buyer orders) ──
+                                    Shows WHICH farmers supplied the order at which farmgate
+                                    prices, the weighted average sourcing cost and the admin's
+                                    net profit (fixed buyer revenue − farmer cost). */}
+                                {(() => {
+                                  const allocs: any[] = (tx.order as any)?.sourcingAllocations || [];
+                                  const wAvg = Number((tx.order as any)?.weightedAvgSourcingCost) || 0;
+                                  const farmerCost = Number((tx.order as any)?.sourcingCostTotal) || 0;
+                                  const netProfit = Number((tx.order as any)?.netAdminProfit) || 0;
+                                  if (allocs.length === 0 && wAvg <= 0 && farmerCost <= 0) return null;
+                                  return (
+                                    <div className="bg-emerald-50/70 border border-emerald-200 rounded-2xl p-2.5 space-y-1.5">
+                                      <p className="text-[10px] font-extrabold text-emerald-950 flex items-center gap-1.5">
+                                        <Layers className="w-3.5 h-3.5 text-emerald-700" />
+                                        Multi-Farmer Sourcing — Weighted Cost & Net Profit
+                                      </p>
+                                      {allocs.length > 0 && (
+                                        <p className="text-[10px] text-neutral-700 font-medium leading-relaxed">
+                                          {allocs
+                                            .map(
+                                              (a) =>
+                                                `${a.quantity}kg @₱${Number(a.farmgatePrice).toFixed(2)} (${a.isWarehouse ? 'Warehouse' : a.farmerName || 'Farmer'})`
+                                            )
+                                            .join(' + ')}
+                                        </p>
+                                      )}
+                                      <div className="flex flex-wrap gap-1.5">
+                                        <span className="text-[9px] font-extrabold text-amber-900 bg-amber-100 border border-amber-200 rounded-lg px-2 py-0.5">
+                                          Farmer Cost: ₱{farmerCost.toFixed(2)}
+                                        </span>
+                                        <span className="text-[9px] font-extrabold text-sky-900 bg-sky-100 border border-sky-200 rounded-lg px-2 py-0.5">
+                                          Weighted Avg: {wAvg > 0 ? `₱${wAvg.toFixed(2)}/kg` : '—'}
+                                        </span>
+                                        <span
+                                          className={`text-[9px] font-extrabold rounded-lg px-2 py-0.5 border ${
+                                            netProfit >= 0
+                                              ? 'text-emerald-900 bg-emerald-100 border-emerald-200'
+                                              : 'text-red-800 bg-red-100 border-red-300'
+                                          }`}
+                                        >
+                                          Net Profit: ₱{netProfit.toFixed(2)}
+                                        </span>
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+
                                 {/* Action: Open Digital Receipt & Mark Completed */}
                                 <div className="flex items-center justify-between pt-1 gap-2 flex-wrap">
                                   <div className="text-[10px] text-neutral-500">
@@ -4277,8 +5242,10 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                   </div>
                                 </div>
                               </div>
+                              </React.Fragment>
                             );
                           })
+                          })()
                         )}
                       </div>
                     </div>
@@ -5052,6 +6019,14 @@ export const AdminApp: React.FC<AdminAppProps> = ({
         </div>
       )}
 
+      {/* DA Verification Review — View Documents modal */}
+      <VerificationReviewModal
+        user={verificationUser}
+        onClose={() => setVerificationUser(null)}
+        onApprove={(u) => handleVerificationDecision(u, 'Approved')}
+        onReject={(u) => handleVerificationDecision(u, 'Rejected')}
+      />
+
       {/* Buy Produce from Farmer Modal (shelving happens later via Put in Stock) */}
       {buyingProduceItem && (
         <div className="absolute inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
@@ -5666,6 +6641,38 @@ export const AdminApp: React.FC<AdminAppProps> = ({
         </div>
       )}
 
+      {/* Delete Warehouse Stock Confirmation (Stocks menu product card) */}
+      {warehouseStockToDelete && (
+        <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-3xl p-5 max-w-xs w-full space-y-3 shadow-xl text-center animate-in zoom-in-95 duration-150">
+            <div className="w-10 h-10 rounded-2xl bg-rose-100 text-rose-600 flex items-center justify-center mx-auto">
+              <Trash2 className="w-5 h-5" />
+            </div>
+            <h3 className="font-bold text-sm text-neutral-900">Delete "{warehouseStockToDelete.name}" from Stocks?</h3>
+            <p className="text-xs text-neutral-500 leading-relaxed">
+              This will remove the product and all {warehouseStockToDelete.stockQuantity} {warehouseStockToDelete.unit}s of its
+              warehouse stock{warehouseStockToDelete.linkedProduceIds.length > 1 ? ` (${warehouseStockToDelete.linkedProduceIds.length} stocking lots)` : ''} from the
+              Stocks menu and the buyer-facing Market. This action cannot be undone.
+            </p>
+            <div className="flex gap-2 pt-2">
+              <button
+                onClick={() => setWarehouseStockToDelete(null)}
+                className="flex-1 py-2 bg-neutral-100 hover:bg-neutral-200 rounded-xl text-xs font-bold text-neutral-700 cursor-pointer transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                id="btn-confirm-delete-warehouse-stock"
+                onClick={handleDeleteWarehouseStock}
+                className="flex-1 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold cursor-pointer transition-colors shadow-xs active:scale-95"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* CHAT FARMER MODAL (ADMIN TO FARMER DIRECT CHAT) */}
       {chattingProduce && (
         <div className="absolute inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 animate-in fade-in duration-150">
@@ -5876,6 +6883,94 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                 <Send className="w-4 h-4" />
               </button>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── Price Adjustment Quote modal (loss prevention) ────────────────────
+          Farmers asking above the fixed buyer price block fulfillment. This
+          modal proposes the adjusted price (new farmgate × 1.10) to the buyer;
+          fulfillment proceeds only after they approve. */}
+      {quoteDraft && (
+        <div className="absolute inset-0 z-60 bg-black/60 backdrop-blur-xs flex flex-col justify-end sm:justify-center p-0 animate-in fade-in duration-200">
+          <div className="bg-white rounded-t-3xl sm:rounded-3xl w-full max-h-[92%] overflow-y-auto shadow-2xl flex flex-col text-neutral-900 border-t sm:border border-red-200">
+            <div className="p-4 border-b border-neutral-200 flex items-center justify-between sticky top-0 bg-white/95 backdrop-blur-md z-10">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl flex items-center justify-center font-bold bg-red-100 text-red-700">
+                  <AlertTriangle className="w-4 h-4 stroke-[2.5]" />
+                </div>
+                <div>
+                  <h3 className="font-extrabold text-base text-neutral-900 font-display">Send Price Adjustment Quote</h3>
+                  <p className="text-[10px] text-red-700 font-medium">
+                    Buying at the farmer's asking price would lose money — the buyer must approve a new price
+                  </p>
+                </div>
+              </div>
+              <button
+                id="btn-close-quote-modal"
+                onClick={() => setQuoteDraft(null)}
+                className="w-8 h-8 rounded-full bg-neutral-100 text-neutral-600 flex items-center justify-center hover:bg-neutral-200 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-3">
+              <div className="bg-red-50 border border-red-200 rounded-2xl p-3 space-y-1">
+                <p className="text-xs font-extrabold text-red-900">
+                  {quoteDraft.order.id} — {quoteDraft.quote.cropName}
+                </p>
+                <p className="text-[11px] text-red-800 font-medium leading-relaxed">{quoteDraft.quote.reason}</p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="bg-neutral-50 border border-neutral-200 rounded-2xl p-3 text-center">
+                  <p className="text-[10px] font-bold text-neutral-500 uppercase">Current buyer price</p>
+                  <p className="text-lg font-black text-neutral-900">₱{quoteDraft.quote.currentBuyerPrice.toFixed(2)}/kg</p>
+                </div>
+                <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-3 text-center">
+                  <p className="text-[10px] font-bold text-emerald-700 uppercase">Quoted new price</p>
+                  <p className="text-lg font-black text-emerald-800">₱{quoteDraft.quote.proposedBuyerPrice.toFixed(2)}/kg</p>
+                  <p className="text-[9px] text-emerald-700 font-bold">
+                    farmgate ₱{quoteDraft.quote.proposedFarmgatePrice.toFixed(2)} × 1.10
+                  </p>
+                </div>
+              </div>
+
+              <p className="text-[10px] text-neutral-500 flex items-start gap-1.5">
+                <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-emerald-600" />
+                <span>
+                  {quoteDraft.order.buyerName} will see this quote on their order and can approve or decline it. On
+                  approval the order line is re-priced and you can fulfil normally; on decline you can cancel the
+                  order or mark the crop unavailable.
+                </span>
+              </p>
+
+              <div className="flex gap-2 pt-1">
+                <button
+                  id="btn-cancel-quote"
+                  onClick={() => setQuoteDraft(null)}
+                  className="flex-1 min-h-[46px] rounded-2xl bg-neutral-100 hover:bg-neutral-200 text-neutral-700 text-xs font-extrabold cursor-pointer active:scale-95 transition-all"
+                >
+                  Not Now
+                </button>
+                <button
+                  id="btn-confirm-send-quote"
+                  onClick={() => {
+                    if (onSendPriceQuote) {
+                      onSendPriceQuote(quoteDraft.order.id, quoteDraft.quote);
+                    } else {
+                      showToast('Quote sending unavailable — handler missing.');
+                    }
+                    setQuoteDraft(null);
+                  }}
+                  className="flex-1 min-h-[46px] rounded-2xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-extrabold flex items-center justify-center gap-1.5 cursor-pointer active:scale-95 transition-all shadow-md"
+                >
+                  <Send className="w-4 h-4" />
+                  <span>Send Quote to Buyer</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

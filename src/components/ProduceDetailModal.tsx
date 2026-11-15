@@ -8,11 +8,12 @@ import {
   Store,
   Truck,
   MessageSquare,
-  FileText
+  ShoppingBag,
+  Check
 } from 'lucide-react';
 import { ProduceItem, FarmerProfile, UserProfile } from '../types';
-import { getBuyerOriginLabel, isStockedToday } from './ProduceCard';
-import { withAdminCommission } from '../utils/pricing';
+import { getBuyerOriginLabel, isStockedToday, MIN_PRODUCT_KG, MIN_ORDER_KG } from './ProduceCard';
+import { buyerUnitPrice } from '../utils/pricing';
 
 interface ProduceDetailModalProps {
   produce: ProduceItem;
@@ -20,7 +21,7 @@ interface ProduceDetailModalProps {
   currentUser?: UserProfile | null;
   registeredUsers?: UserProfile[];
   onClose: () => void;
-  /** Legacy direct-purchase hook (unused in the request-only market). */
+  /** Buyer action: stage THIS product in the cart for later request building. */
   onAddToCart?: (produce: ProduceItem, quantity: number) => void;
   onDirectChat: (produce: ProduceItem) => void;
   onViewFarm: (farmerId: string) => void;
@@ -35,22 +36,21 @@ export const ProduceDetailModal: React.FC<ProduceDetailModalProps> = ({
   currentUser,
   registeredUsers = [],
   onClose,
+  onAddToCart,
   onDirectChat,
   onViewFarm,
+  isInCart = false,
   isBuyer = true,
   onEditProduce,
 }) => {
-  const [quantity, setQuantity] = useState(1);
-
-  // Buyer action: request THIS product. The request modal lives inside the
-  // Market view — dispatch an app-wide event that BuyerMarketView listens for
-  // (carrying the quantity chosen on the stepper), then close this modal.
-  const handleRequestProduct = () => {
-    window.dispatchEvent(
-      new CustomEvent('veggieconnect:request-product', { detail: { ...produce, requestQty: quantity } })
-    );
-    onClose();
-  };
+  const stockOf = (p: ProduceItem): number =>
+    typeof p.stockQuantity === 'number'
+      ? p.stockQuantity
+      : parseInt(String(p.stockQuantity), 10) || 0;
+  // Stepper starts at the 20 kg per-product minimum (capped at shelf stock);
+  // buyers cannot step below the per-product minimum from here.
+  const initialQty = Math.min(MIN_PRODUCT_KG, Math.max(0, stockOf(produce)));
+  const [quantity, setQuantity] = useState(initialQty > 0 ? initialQty : MIN_PRODUCT_KG);
 
   // Check if this produce belongs to current user
   const isOwnProduce = Boolean(
@@ -71,23 +71,16 @@ export const ProduceDetailModal: React.FC<ProduceDetailModalProps> = ({
     );
 
   const farmerPrice = typeof produce.pricePerUnit === 'number' ? produce.pricePerUnit : parseFloat(produce.pricePerUnit as any) || 0;
-  // Buyer-facing per-kg price = farmer asking price + Admin per-kg commission.
-  // Farmers/admin keep the raw asking price.
-  const rawPrice = isBuyer ? withAdminCommission(farmerPrice) : farmerPrice;
+  // Buyer-facing per-kg price = FIXED DA-anchored market price per commodity
+  // (DA Suggested Direct × 1.10) — independent of the farmer's asking price.
+  // Farmers/admin keep the raw farmgate asking price.
+  const rawPrice = isBuyer ? buyerUnitPrice(produce) : farmerPrice;
 
-  // Bulk discount calculation
-  const bulkDiscountActive =
-    produce.bulkDiscount && quantity >= produce.bulkDiscount.minQty;
-  const effectivePrice = bulkDiscountActive
-    ? rawPrice * (1 - produce.bulkDiscount!.discountPercent / 100)
-    : rawPrice;
-
-  const totalPrice = (effectivePrice * quantity).toFixed(2);
-  const stockAvailable =
-    typeof produce.stockQuantity === 'number'
-      ? produce.stockQuantity
-      : parseInt(String(produce.stockQuantity), 10) || 0;
+  const stockAvailable = stockOf(produce);
   const unit = produce.unit || 'kg';
+  // 20 kg per-product minimum: a shelf with less than 20 kg can never satisfy
+  // the rule, so this product cannot be ordered as a line item right now.
+  const canOrderProduct = stockAvailable >= MIN_PRODUCT_KG;
 
   // Buyer anonymity: origin is province level only ("Negros Oriental") —
   // never farmer or farm names.
@@ -237,7 +230,7 @@ export const ProduceDetailModal: React.FC<ProduceDetailModalProps> = ({
                 <span className="font-bold">Wholesale Volume Discount: </span>
                 Buy {produce.bulkDiscount.minQty}+ kg & save {produce.bulkDiscount.discountPercent}%!
               </div>
-              {bulkDiscountActive && (
+              {quantity >= produce.bulkDiscount.minQty && (
                 <span className="bg-emerald-700 text-white px-2 py-0.5 rounded-full font-bold text-[10px]">
                   ACTIVE
                 </span>
@@ -256,17 +249,19 @@ export const ProduceDetailModal: React.FC<ProduceDetailModalProps> = ({
           </div>
         </div>
 
-        {/* Bottom Sticky Action Bar — BUYERS REQUEST ONLY (no direct buying) */}
+        {/* Bottom Sticky Action Bar — BUYERS ADD TO CART (requests are raised
+            from the Cart menu's "Request Crops" button) */}
         {isBuyer ? (
           <div className="p-4 bg-white border-t border-emerald-100 sticky bottom-0 shadow-lg space-y-2.5">
             <div className="flex items-center justify-between gap-3">
-              {/* Quantity Stepper (capped at farmer's available stock) */}
+              {/* Quantity Stepper (20 kg per-product minimum, capped at stock) */}
               <div className="flex items-center gap-2 bg-emerald-50 border border-emerald-200 rounded-2xl p-1">
                 <button
                   id="btn-decrease-qty"
-                  onClick={() => setQuantity(Math.max(1, quantity - 1))}
-                  disabled={quantity <= 1}
+                  onClick={() => setQuantity(Math.max(MIN_PRODUCT_KG, quantity - 1))}
+                  disabled={quantity <= MIN_PRODUCT_KG}
                   className="w-10 h-10 rounded-xl bg-white hover:bg-emerald-100 disabled:opacity-40 text-emerald-950 font-bold flex items-center justify-center transition-colors cursor-pointer shadow-xs active:scale-95"
+                  title={`Minimum ${MIN_PRODUCT_KG} kg per product`}
                 >
                   <Minus className="w-4 h-4 stroke-[2.5]" />
                 </button>
@@ -283,20 +278,40 @@ export const ProduceDetailModal: React.FC<ProduceDetailModalProps> = ({
                 </button>
               </div>
 
-              {/* Request This Product Button */}
-              <button
-                id="btn-request-this-product"
-                onClick={handleRequestProduct}
-                disabled={stockAvailable === 0}
-                className="flex-1 min-h-[48px] py-3 px-4 rounded-2xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 transition-all active:scale-95 shadow-xs cursor-pointer"
-              >
-                <FileText className="w-4 h-4" />
-                <span>Request {quantity} {unit} • ₱{totalPrice}</span>
-              </button>
+              {/* Per-product minimum note */}
+              <p className="text-[10px] text-neutral-500 font-medium text-right leading-tight">
+                Min <span className="font-bold text-emerald-800">{MIN_PRODUCT_KG} kg</span> per product
+                <br />
+                Total order min <span className="font-bold text-emerald-800">{MIN_ORDER_KG} kg</span>
+              </p>
             </div>
+
+            {/* Add to Cart: stage this product in the cart so the buyer can
+                keep adding other products before submitting one request. */}
+            <button
+              id="btn-detail-add-to-cart"
+              onClick={() => {
+                if (onAddToCart) onAddToCart(produce, quantity);
+              }}
+              disabled={!canOrderProduct || !onAddToCart}
+              className={`w-full min-h-[42px] py-2.5 px-4 rounded-2xl font-bold text-xs flex items-center justify-center gap-2 transition-all active:scale-95 cursor-pointer disabled:opacity-50 ${
+                isInCart
+                  ? 'bg-emerald-700 text-white hover:bg-emerald-800'
+                  : 'bg-white text-emerald-700 border border-emerald-300 hover:bg-emerald-50'
+              }`}
+            >
+              {isInCart ? <Check className="w-4 h-4" /> : <ShoppingBag className="w-4 h-4" />}
+              <span>
+                {!canOrderProduct && stockAvailable > 0
+                  ? `Needs ${MIN_PRODUCT_KG} kg minimum — only ${stockAvailable} ${unit} left`
+                  : isInCart
+                    ? `Added — Add ${quantity} more ${unit} to Cart`
+                    : `Add ${quantity} ${unit} to Cart`}
+              </span>
+            </button>
             <p className="text-[10px] text-neutral-500 text-center font-medium flex items-center justify-center gap-1">
               <ShieldCheck className="w-3 h-3 text-emerald-600" />
-              Sends a purchase request to the Admin for processing.
+              Submit your order from the Cart menu (min {MIN_ORDER_KG} kg total).
             </p>
           </div>
         ) : (

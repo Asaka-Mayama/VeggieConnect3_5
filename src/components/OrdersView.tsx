@@ -16,8 +16,21 @@ import {
   XCircle,
   AlertTriangle,
   RotateCcw,
+  CalendarDays,
+  TrendingUp,
+  Wallet,
+  BadgeCheck,
 } from 'lucide-react';
 import { Order, OrderStatus, UserRole, UserProfile } from '../types';
+import {
+  UNRECORDED_DATE_KEY,
+  getOrderDateKey,
+  formatDateKeyLabel,
+  formatDateKeyShort,
+  formatOrderDateTime,
+  sortDateKeysDesc,
+  orderAmount,
+} from '../utils/orderDates';
 import { FarmRouteMap } from './FarmRouteMap';
 import {
   getAdminProfileForLocationFallback,
@@ -40,7 +53,17 @@ interface OrdersViewProps {
     cancelledBy?: string
   ) => void;
   onChatWithParty?: (order: Order) => void;
+  /** Buyer wallet payment: pays an admin-approved order from VeggieConnect Pay. */
+  onPayOrder?: (orderId: string) => void;
+  /** Buyer approves / declines a Price Adjustment Quote on a pending order. */
+  onRespondPriceQuote?: (orderId: string, quoteId: string, approve: boolean) => void;
+  /** Opens the buyer's Wallet tab (e.g. to deposit after insufficient balance). */
+  onNavigateToWallet?: () => void;
 }
+
+/** Sales total for a list of orders — cancelled transactions never count as sales. */
+const salesSum = (list: Order[]) =>
+  list.filter((o) => o.status !== 'cancelled').reduce((s, o) => s + orderAmount(o), 0);
 
 export const OrdersView: React.FC<OrdersViewProps> = ({
   orders,
@@ -50,6 +73,9 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   initialFilter,
   onUpdateOrderStatus,
   onChatWithParty,
+  onPayOrder,
+  onRespondPriceQuote,
+  onNavigateToWallet,
 }) => {
   const [filter, setFilter] = useState<'all' | 'active' | 'completed' | 'cancelled'>(
     initialFilter || 'all'
@@ -59,6 +85,10 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
   const [cancelReasonInput, setCancelReasonInput] = useState<string>('');
   // Distance / ETA reported by each live route map (supermarket hub ➔ farmer's house)
   const [routeStatsByOrder, setRouteStatsByOrder] = useState<Record<string, { km: number; durationText: string }>>({});
+
+  // DATE CATEGORY (Farmer Orders): 'all' or a local YYYY-MM-DD day key.
+  // Lets the farmer browse transactions per date and read that day's total sales.
+  const [selectedDateKey, setSelectedDateKey] = useState<string>('all');
 
   // Order cards stay collapsed to a compact summary until the user expands them.
   const [expandedOrderIds, setExpandedOrderIds] = useState<Set<string>>(new Set());
@@ -116,6 +146,69 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
     }
     return true;
   });
+
+  // ===== DATE CATEGORY (Farmer Orders) =====
+  // Buckets every transaction of this farmer under its LOCAL calendar day so the
+  // Orders menu can be browsed per date and show that day's total sales.
+  const farmerDateBuckets = useMemo(() => {
+    if (userRole !== 'farmer') return null;
+    const map = new Map<string, Order[]>();
+    roleFilteredOrders.forEach((o) => {
+      const key = getOrderDateKey(o.createdAt);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(o);
+    });
+    return { keys: sortDateKeysDesc([...map.keys()]), map };
+  }, [userRole, roleFilteredOrders]);
+
+  const farmerDateCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    if (!farmerDateBuckets) return counts;
+    farmerDateBuckets.keys.forEach((key) => {
+      counts[key] = (farmerDateBuckets.map.get(key) || []).length;
+    });
+    return counts;
+  }, [farmerDateBuckets]);
+
+  // Total-sales summary for the selected date (or All Dates). Cancelled
+  // transactions are excluded from sales, matching the Farmer dashboard's
+  // "Total Sales" basis (order total). Delivered vs in-progress split shown.
+  const farmerSummary = useMemo(() => {
+    if (!farmerDateBuckets) return null;
+    const inScope =
+      selectedDateKey === 'all'
+        ? roleFilteredOrders
+        : roleFilteredOrders.filter((o) => getOrderDateKey(o.createdAt) === selectedDateKey);
+    return {
+      label: selectedDateKey === 'all' ? 'All Dates' : formatDateKeyLabel(selectedDateKey),
+      total: salesSum(inScope),
+      delivered: salesSum(inScope.filter((o) => o.status === 'completed')),
+      inProgress: salesSum(
+        inScope.filter((o) => o.status !== 'completed' && o.status !== 'cancelled')
+      ),
+      txCount: inScope.length,
+      cancelledCount: inScope.filter((o) => o.status === 'cancelled').length,
+    };
+  }, [farmerDateBuckets, roleFilteredOrders, selectedDateKey]);
+
+  // Orders actually listed: honours the status tab AND the selected date,
+  // sorted newest day first (unrecorded dates last) so per-date sections
+  // render as clean consecutive groups.
+  const displayOrders = useMemo(() => {
+    if (userRole !== 'farmer') return filteredOrders;
+    const scoped =
+      selectedDateKey === 'all'
+        ? filteredOrders
+        : filteredOrders.filter((o) => getOrderDateKey(o.createdAt) === selectedDateKey);
+    return [...scoped].sort((a, b) => {
+      const ka = getOrderDateKey(a.createdAt);
+      const kb = getOrderDateKey(b.createdAt);
+      if (ka === UNRECORDED_DATE_KEY && kb !== UNRECORDED_DATE_KEY) return 1;
+      if (kb === UNRECORDED_DATE_KEY && ka !== UNRECORDED_DATE_KEY) return -1;
+      if (ka !== kb) return kb.localeCompare(ka);
+      return 0;
+    });
+  }, [userRole, filteredOrders, selectedDateKey]);
 
   // Origin of the live route map — the admin/supermarket location saved from
   // Admin > Profile (with the registered admin account as a safe fallback).
@@ -229,13 +322,91 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         ))}
       </div>
 
-      {filteredOrders.length > 0 && (
+      {/* DATE CATEGORY CHIPS + TOTAL SALES SUMMARY (Farmer Orders) */}
+      {userRole === 'farmer' && farmerDateBuckets && farmerDateBuckets.keys.length > 0 && (
+        <>
+          <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1">
+            <button
+              id="chip-farmer-dates-all"
+              onClick={() => setSelectedDateKey('all')}
+              className={`min-h-[36px] px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 transition-all cursor-pointer ${
+                selectedDateKey === 'all'
+                  ? 'bg-emerald-700 text-white shadow-xs'
+                  : 'bg-white text-emerald-950 border border-emerald-200 hover:bg-emerald-50'
+              }`}
+            >
+              <CalendarDays className="w-3.5 h-3.5" />
+              <span>All Dates</span>
+              <span
+                className={`text-[9px] font-black px-1.5 py-0.5 rounded-full ${
+                  selectedDateKey === 'all' ? 'bg-white/20 text-white' : 'bg-emerald-100 text-emerald-800'
+                }`}
+              >
+                {roleFilteredOrders.length}
+              </span>
+            </button>
+            {farmerDateBuckets.keys.map((key) => (
+              <button
+                key={key}
+                id={`chip-farmer-date-${key}`}
+                onClick={() => setSelectedDateKey(key)}
+                className={`min-h-[36px] px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shrink-0 transition-all cursor-pointer ${
+                  selectedDateKey === key
+                    ? 'bg-emerald-700 text-white shadow-xs'
+                    : 'bg-white text-emerald-950 border border-emerald-200 hover:bg-emerald-50'
+                }`}
+              >
+                <CalendarDays className="w-3.5 h-3.5" />
+                <span>{formatDateKeyShort(key)}</span>
+                <span
+                  className={`text-[9px] font-black px-1.5 py-0.5 rounded-full ${
+                    selectedDateKey === key ? 'bg-white/20 text-white' : 'bg-emerald-100 text-emerald-800'
+                  }`}
+                >
+                  {farmerDateCounts[key] || 0}
+                </span>
+              </button>
+            ))}
+          </div>
+
+          {farmerSummary && (
+            <div
+              id="farmer-date-sales-summary"
+              className="bg-gradient-to-r from-emerald-800 via-teal-800 to-emerald-900 text-white rounded-2xl p-3.5 shadow-sm border border-emerald-700/60"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-bold text-emerald-200 uppercase tracking-wider flex items-center gap-1.5 min-w-0">
+                  <CalendarDays className="w-3.5 h-3.5 text-emerald-300 flex-shrink-0" />
+                  <span className="truncate">Total Sales — {farmerSummary.label}</span>
+                </span>
+                <span className="text-[9px] bg-emerald-500/80 text-white font-extrabold px-1.5 py-0.5 rounded-md whitespace-nowrap flex-shrink-0">
+                  {farmerSummary.txCount} Transaction{farmerSummary.txCount === 1 ? '' : 's'}
+                </span>
+              </div>
+              <div className="flex items-center gap-1.5 mt-1">
+                <TrendingUp className="w-4 h-4 text-emerald-300 flex-shrink-0" />
+                <span className="text-2xl font-black font-mono">
+                  ₱{farmerSummary.total.toLocaleString('en-PH', { minimumFractionDigits: 2 })}
+                </span>
+              </div>
+              <p className="text-[10px] text-emerald-200/90 mt-1">
+                Delivered ₱{farmerSummary.delivered.toFixed(2)} · In Progress ₱{farmerSummary.inProgress.toFixed(2)}
+                {farmerSummary.cancelledCount > 0
+                  ? ` · ${farmerSummary.cancelledCount} cancelled not counted`
+                  : ''}
+              </p>
+            </div>
+          )}
+        </>
+      )}
+
+      {displayOrders.length > 0 && (
         <p className="text-[10px] text-neutral-400 font-medium -mt-2 px-1">
           Tap an order to view full details, map &amp; actions
         </p>
       )}
 
-      {filteredOrders.length === 0 ? (
+      {displayOrders.length === 0 ? (
         <div className="bg-white border border-emerald-200/80 rounded-2xl p-8 text-center space-y-3 shadow-xs">
           <div className="w-14 h-14 rounded-full bg-emerald-50 text-emerald-800 flex items-center justify-center mx-auto text-2xl">
             📦
@@ -244,14 +415,57 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
           <p className="text-xs text-neutral-500 max-w-xs mx-auto leading-relaxed">
             {userRole === 'buyer'
               ? 'Place an order in the market to connect directly with your local farmers.'
+              : userRole === 'farmer' && selectedDateKey !== 'all'
+              ? 'No transactions recorded on the selected date.'
               : 'No orders match this filter right now.'}
           </p>
         </div>
       ) : (
         <div className="space-y-3">
-          {filteredOrders.map((order) => {
+          {displayOrders.map((order, orderIdx) => {
             const step = getStepNumber(order.status);
             const isOrderExpanded = expandedOrderIds.has(order.id);
+
+            // DATE CATEGORY (Farmer Orders): a section header is rendered above
+            // the FIRST transaction of every calendar day, carrying that day's
+            // own sales total so each date is self-explanatory.
+            const orderDateKey = getOrderDateKey(order.createdAt);
+            const prevOrder = orderIdx > 0 ? displayOrders[orderIdx - 1] : undefined;
+            const showDateHeader =
+              userRole === 'farmer' &&
+              (!prevOrder || getOrderDateKey(prevOrder.createdAt) !== orderDateKey);
+            const sameDayOrders =
+              userRole === 'farmer'
+                ? displayOrders.filter((o) => getOrderDateKey(o.createdAt) === orderDateKey)
+                : [];
+            const dateSectionHeader = showDateHeader ? (
+              <div
+                id={`date-section-${orderDateKey}`}
+                className="bg-emerald-50 border border-emerald-200 rounded-2xl px-3 py-2.5 flex items-center justify-between gap-2"
+              >
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <CalendarDays className="w-4 h-4 text-emerald-700 flex-shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-xs font-extrabold text-emerald-950 truncate">
+                      {formatDateKeyLabel(orderDateKey)}
+                    </p>
+                    <p className="text-[10px] text-neutral-500 font-medium">
+                      {sameDayOrders.length} transaction{sameDayOrders.length === 1 ? '' : 's'}
+                    </p>
+                  </div>
+                </div>
+                <span
+                  className={`text-[11px] font-black flex-shrink-0 whitespace-nowrap ${
+                    sameDayOrders.some((o) => o.status === 'cancelled') &&
+                    sameDayOrders.every((o) => o.status === 'cancelled')
+                      ? 'text-red-600'
+                      : 'text-emerald-800'
+                  }`}
+                >
+                  Sales: ₱{salesSum(sameDayOrders).toFixed(2)}
+                </span>
+              </div>
+            ) : null;
 
             // LIVE ROUTE (farmer): supermarket hub ➔ the supplying farm's house while the order is active.
             // Resolve strictly from THIS order (item farmer first, then order farmer/account) so two
@@ -315,8 +529,9 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
               : 0;
 
             return (
+              <React.Fragment key={order.id}>
+                {dateSectionHeader}
               <div
-                key={order.id}
                 id={`order-card-${order.id}`}
                 className="bg-white border border-emerald-200/85 rounded-2xl p-4 space-y-3 shadow-xs"
               >
@@ -331,6 +546,12 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                       <span className="font-bold text-emerald-950 truncate">{order.id}</span>
                       <span className="flex-shrink-0">{getStatusBadge(order.status)}</span>
                     </div>
+                    {formatOrderDateTime(order.createdAt) && (
+                      <div className="flex items-center gap-1 text-[10px] text-neutral-400">
+                        <Clock className="w-3 h-3 flex-shrink-0" />
+                        <span>{formatOrderDateTime(order.createdAt)}</span>
+                      </div>
+                    )}
                     <div className="flex items-center justify-between gap-2 text-[11px]">
                       <span className="text-neutral-500 truncate">
                         {order.items[0]
@@ -408,16 +629,21 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         <img
                           src={item.imageUrl}
                           alt={item.produceName}
-                          className="w-8 h-8 rounded-lg object-cover bg-emerald-100"
+                          className={`w-8 h-8 rounded-lg object-cover bg-emerald-100 ${item.itemStatus === 'unavailable' ? 'opacity-40 grayscale' : ''}`}
                         />
-                        <span className="truncate text-xs font-bold text-emerald-950">
+                        <span className={`truncate text-xs font-bold ${item.itemStatus === 'unavailable' ? 'text-neutral-400 line-through' : 'text-emerald-950'}`}>
                           {item.produceName}
                         </span>
                         <span className="text-neutral-500 text-[11px]">
                           × {item.quantity} kg
                         </span>
+                        {item.itemStatus === 'unavailable' && (
+                          <span className="text-[9px] font-black uppercase bg-red-100 text-red-700 border border-red-200 rounded-full px-1.5 py-0.5 flex-shrink-0">
+                            Unavailable{item.refundedAmount ? ` • ₱${Number(item.refundedAmount).toFixed(2)}` : ''}
+                          </span>
+                        )}
                       </div>
-                      <span className="font-bold text-emerald-950 flex-shrink-0">
+                      <span className={`font-bold flex-shrink-0 ${item.itemStatus === 'unavailable' ? 'text-neutral-400 line-through' : 'text-emerald-950'}`}>
                         ₱{(Number((item.unitPrice || item.pricePerUnit || 0) * (item.quantity || 1)) || 0).toFixed(2)}
                       </span>
                     </div>
@@ -438,11 +664,166 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         </>
                       )}
                     </span>
-                    <span className="font-black text-emerald-950 text-xs">
-                      Total: ₱{(Number(order.totalAmount ?? order.subtotal) || 0).toFixed(2)}
+                    <span className="text-right">
+                      {Number(order.refundedTotal) > 0 && (
+                        <span className="block text-[10px] text-red-600 font-bold">
+                          Refunded: −₱{Number(order.refundedTotal).toFixed(2)}
+                        </span>
+                      )}
+                      <span className="font-black text-emerald-950 text-xs">
+                        {order.paymentStatus === 'paid' && Number(order.paidAmount) >= 0
+                          ? `Paid: ₱${Number(order.paidAmount).toFixed(2)}`
+                          : `Total: ₱${(Number(order.totalAmount ?? order.subtotal) || 0).toFixed(2)}`}
+                      </span>
                     </span>
                   </div>
                 </div>
+
+                {/* PRICE ADJUSTMENT QUOTES (buyer): when farmers ask above the
+                    fixed market price, the Admin blocks fulfillment and sends
+                    a quote — the buyer approves the new price (farmgate × 1.10)
+                    before the Admin buys from farmers. */}
+                {userRole === 'buyer' && order.status === 'pending' && (order.priceQuotes || []).length > 0 && (
+                  <div className="space-y-2">
+                    {(order.priceQuotes || []).map((quote) => {
+                      if (quote.status !== 'pending') {
+                        return (
+                          <div
+                            key={quote.id}
+                            className={`flex items-center gap-1.5 rounded-2xl px-3 py-2 text-[11px] font-bold border ${
+                              quote.status === 'approved'
+                                ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                                : 'bg-neutral-100 border-neutral-200 text-neutral-600'
+                            }`}
+                          >
+                            {quote.status === 'approved' ? (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                            ) : (
+                              <XCircle className="w-4 h-4 text-neutral-400 flex-shrink-0" />
+                            )}
+                            <span>
+                              Price quote {quote.status} — {quote.cropName}{' '}
+                              {quote.status === 'approved'
+                                ? `now ₱${quote.proposedBuyerPrice.toFixed(2)}/kg`
+                                : `stays ₱${quote.currentBuyerPrice.toFixed(2)}/kg`}
+                            </span>
+                          </div>
+                        );
+                      }
+                      return (
+                        <div
+                          key={quote.id}
+                          id={`quote-card-${quote.id}`}
+                          className="bg-amber-50 border border-amber-300 rounded-2xl p-3 space-y-2"
+                        >
+                          <div className="flex items-start gap-1.5">
+                            <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+                            <div className="min-w-0">
+                              <p className="text-xs font-extrabold text-amber-950">
+                                Price Adjustment Quote — {quote.cropName}
+                              </p>
+                              <p className="text-[10px] text-amber-900 font-medium leading-relaxed mt-0.5">{quote.reason}</p>
+                            </div>
+                          </div>
+                          <div className="flex items-center justify-between bg-white border border-amber-200 rounded-xl px-2.5 py-1.5">
+                            <span className="text-[10px] font-bold text-neutral-500 line-through">₱{quote.currentBuyerPrice.toFixed(2)}/kg</span>
+                            <span className="text-[10px] font-black text-amber-800">→</span>
+                            <span className="text-xs font-black text-emerald-800">₱{quote.proposedBuyerPrice.toFixed(2)}/kg</span>
+                          </div>
+                          <div className="flex gap-2">
+                            {onRespondPriceQuote && (
+                              <>
+                                <button
+                                  id={`btn-decline-quote-${quote.id}`}
+                                  onClick={() => onRespondPriceQuote(order.id, quote.id, false)}
+                                  className="flex-1 min-h-[40px] rounded-xl bg-white border border-neutral-300 text-neutral-700 text-[11px] font-extrabold cursor-pointer hover:bg-neutral-50 active:scale-95 transition-all"
+                                >
+                                  Decline
+                                </button>
+                                <button
+                                  id={`btn-approve-quote-${quote.id}`}
+                                  onClick={() => onRespondPriceQuote(order.id, quote.id, true)}
+                                  className="flex-1 min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-extrabold cursor-pointer active:scale-95 transition-all shadow-sm"
+                                >
+                                  Approve & Pay New Price
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {/* WALLET PAYMENT (buyer): pay AFTER admin approval, BEFORE the
+                    live transaction. Pending orders show an approval notice;
+                    approved unpaid orders show the Pay Now action; paid orders
+                    show a settled badge. */}
+                {userRole === 'buyer' && order.status !== 'cancelled' && (() => {
+                  const payable = Math.max(0, (Number(order.totalAmount ?? order.subtotal) || 0) - (Number(order.refundedTotal) || 0));
+                  const isPaid = order.paymentStatus === 'paid';
+                  const isApproved = order.status !== 'pending';
+                  if (isPaid) {
+                    return (
+                      <div className="flex items-center justify-between gap-2 bg-emerald-600/10 border border-emerald-600/40 rounded-2xl px-3 py-2.5">
+                        <span className="flex items-center gap-1.5 text-xs font-extrabold text-emerald-900">
+                          <BadgeCheck className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                          <span>Paid via Wallet{order.paidAmount !== undefined ? ` — ₱${Number(order.paidAmount).toFixed(2)}` : ''}</span>
+                        </span>
+                        {Number(order.refundedCredited) > 0 && (
+                          <span className="text-[10px] font-bold text-emerald-800">
+                            Refunded to wallet: ₱{Number(order.refundedCredited).toFixed(2)}
+                          </span>
+                        )}
+                      </div>
+                    );
+                  }
+                  if (!isApproved) {
+                    return (
+                      <div className="flex items-center gap-1.5 bg-amber-50 border border-amber-200 rounded-2xl px-3 py-2.5 text-[11px] font-bold text-amber-900">
+                        <Clock className="w-4 h-4 text-amber-600 flex-shrink-0" />
+                        <span>
+                          Awaiting Admin approval — pay ₱{payable.toFixed(2)} from your wallet once approved. The live transaction starts after payment.
+                        </span>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="bg-emerald-50 border border-emerald-300 rounded-2xl p-3 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="flex items-center gap-1.5 text-xs font-extrabold text-emerald-900">
+                          <Wallet className="w-4 h-4 text-emerald-700 flex-shrink-0" />
+                          <span>Order approved — pay to start the transaction</span>
+                        </span>
+                        <span className="text-sm font-black text-emerald-900 font-mono">₱{payable.toFixed(2)}</span>
+                      </div>
+                      {(Number(order.refundedTotal) || 0) > 0 && (
+                        <p className="text-[10px] font-bold text-emerald-800">
+                          Includes −₱{Number(order.refundedTotal).toFixed(2)} returned for unavailable products.
+                        </p>
+                      )}
+                      {onPayOrder && (
+                        <button
+                          id={`btn-pay-order-${order.id}`}
+                          onClick={() => onPayOrder(order.id)}
+                          className="w-full min-h-[44px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-sm active:scale-[0.98] transition-all"
+                        >
+                          <Wallet className="w-4 h-4" />
+                          <span>Pay Now from Wallet • ₱{payable.toFixed(2)}</span>
+                        </button>
+                      )}
+                      {onNavigateToWallet && (
+                        <button
+                          onClick={onNavigateToWallet}
+                          className="w-full text-[10px] font-bold text-emerald-800 hover:text-emerald-950 underline underline-offset-2 cursor-pointer"
+                        >
+                          Balance low? Open Wallet to deposit
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {/* LIVE ROUTE MAP: Farmer's House (Left) ➔ Supermarket Hub (Right).
                     Buyers only see it AFTER Admin confirms the request — while
@@ -489,9 +870,24 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                   {userRole === 'farmer' && order.deliveryType === 'direct_delivery' && (
                     <div className="w-full">
                       {order.status === 'pending' && (
-                        <div className="flex items-center gap-1.5 text-xs font-bold text-amber-900 bg-amber-50 border border-amber-200 px-3 py-2 rounded-xl">
-                          <Clock className="w-3.5 h-3.5 text-amber-600 animate-spin flex-shrink-0" />
-                          <span>Order placed — waiting for the supermarket to start the pickup route</span>
+                        <div className="space-y-2">
+                          {onUpdateOrderStatus ? (
+                            <button
+                              id={`btn-farmer-confirm-procurement-${order.id}`}
+                              onClick={() => onUpdateOrderStatus(order.id, 'confirmed')}
+                              className="w-full h-10 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-xs active:scale-95 transition-all"
+                            >
+                              <CheckCircle2 className="w-4 h-4 flex-shrink-0" />
+                              <span className="truncate">Confirm Order (Fresh-Pick & Ready for Pickup)</span>
+                            </button>
+                          ) : null}
+                          <div className="flex items-center gap-1.5 text-xs font-bold text-amber-900 bg-amber-50 border border-amber-200 px-3 py-2 rounded-xl">
+                            <Clock className="w-3.5 h-3.5 text-amber-600 flex-shrink-0" />
+                            <span>
+                              The supermarket can only start the pickup route AFTER you confirm this order. Please
+                              confirm so the live transport can begin.
+                            </span>
+                          </div>
                         </div>
                       )}
                       {order.status === 'confirmed' && (
@@ -606,8 +1002,9 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                       </>
                     )}
 
-                    {/* Buyer can confirm receipt if ready for farm_pickup */}
-                    {userRole === 'buyer' && order.deliveryType === 'farm_pickup' && order.status === 'ready_for_pickup_delivery' && onUpdateOrderStatus && (
+                    {/* Buyer can confirm receipt if ready for farm_pickup AND
+                        the order is paid — payment gates every completion. */}
+                    {userRole === 'buyer' && order.deliveryType === 'farm_pickup' && order.status === 'ready_for_pickup_delivery' && order.paymentStatus === 'paid' && onUpdateOrderStatus && (
                       <button
                         onClick={() => onUpdateOrderStatus(order.id, 'completed')}
                         className="flex-1 min-w-[130px] h-10 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-xs active:scale-95"
@@ -637,6 +1034,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                 </div>
                 )}
               </div>
+              </React.Fragment>
             );
           })}
         </div>

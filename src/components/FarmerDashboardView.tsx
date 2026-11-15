@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sprout, Plus, Package, TrendingUp, Edit3, Trash2, ShieldCheck, CheckCircle2, Clock, AlertCircle, LogOut, MessageSquare, Truck, User, Camera, Edit2, BarChart2, ArrowRight, ChevronDown } from 'lucide-react';
+import { Sprout, Plus, Package, TrendingUp, Edit3, Trash2, ShieldCheck, CheckCircle2, Clock, AlertCircle, LogOut, MessageSquare, Truck, User, Camera, Edit2, BarChart2, ArrowRight, ChevronDown, IdCard } from 'lucide-react';
 import { ProduceItem, FarmerProfile, Order, UserProfile } from '../types';
 import { DAPriceWatchWidget } from './DAPriceWatchWidget';
 import { DAPriceWatchModal } from './DAPriceWatchModal';
@@ -11,6 +11,8 @@ interface FarmerDashboardViewProps {
   orders: Order[];
   currentUser?: UserProfile | null;
   registeredUsers?: UserProfile[];
+  /** DA verification workflow: PENDING farmers cannot submit harvests yet. */
+  verificationPending?: boolean;
   onOpenAddProduce: () => void;
   onOpenEditProduce: (produce: ProduceItem) => void;
   onOpenEditProfile?: () => void;
@@ -34,6 +36,7 @@ export const FarmerDashboardView: React.FC<FarmerDashboardViewProps> = ({
   orders,
   currentUser,
   registeredUsers = [],
+  verificationPending = false,
   onOpenAddProduce,
   onOpenEditProduce,
   onOpenEditProfile,
@@ -159,13 +162,33 @@ export const FarmerDashboardView: React.FC<FarmerDashboardViewProps> = ({
           <button
             id="btn-farmer-list-harvest"
             onClick={onOpenAddProduce}
-            className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center gap-1.5 shadow-sm active:scale-95 transition-all cursor-pointer"
+            disabled={verificationPending}
+            title={verificationPending ? 'Locked — pending DA Admin approval' : 'List a new harvest for sale'}
+            className={`px-3 py-1.5 rounded-xl text-white font-bold text-xs flex items-center gap-1.5 shadow-sm transition-all ${
+              verificationPending
+                ? 'bg-neutral-300 cursor-not-allowed'
+                : 'bg-emerald-600 hover:bg-emerald-500 active:scale-95 cursor-pointer'
+            }`}
           >
             <Plus className="w-4 h-4 stroke-[3]" />
-            <span>List Harvest</span>
+            <span>{verificationPending ? 'Locked' : 'List Harvest'}</span>
           </button>
         </div>
       </div>
+
+      {/* PENDING VERIFICATION notice — harvest submission is locked while the
+          DA Admin reviews the farmer's Valid Government ID. */}
+      {verificationPending && (
+        <div className="rounded-2xl border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-amber-900 flex items-start gap-2">
+          <IdCard className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+          <div className="min-w-0">
+            <p className="text-[11px] font-black">Harvest listing locked — Pending Admin Approval</p>
+            <p className="text-[10px] leading-relaxed mt-0.5">
+              Your Valid Government ID is under DA review. You can browse prices, chats and orders, but submitting harvests for sale unlocks once the DA Admin approves your registration.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Metrics Row - Clean White Cards (Currency in Peso only) */}
       <div className="grid grid-cols-2 gap-2.5">
@@ -285,10 +308,14 @@ export const FarmerDashboardView: React.FC<FarmerDashboardViewProps> = ({
             </p>
           </div>
           <button
-            onClick={onOpenAddProduce}
-            className="text-xs text-emerald-700 hover:text-emerald-800 font-bold flex items-center gap-1 cursor-pointer"
+            onClick={verificationPending ? undefined : onOpenAddProduce}
+            disabled={verificationPending}
+            className={`text-xs font-bold flex items-center gap-1 ${
+              verificationPending ? 'text-neutral-400 cursor-not-allowed' : 'text-emerald-700 hover:text-emerald-800 cursor-pointer'
+            }`}
+            title={verificationPending ? 'Locked — pending DA Admin approval' : undefined}
           >
-            <Plus className="w-3.5 h-3.5 stroke-[2.5]" /> Add
+            <Plus className="w-3.5 h-3.5 stroke-[2.5]" /> {verificationPending ? 'Locked' : 'Add'}
           </button>
         </div>
 
@@ -296,10 +323,16 @@ export const FarmerDashboardView: React.FC<FarmerDashboardViewProps> = ({
           <div className="bg-white border border-neutral-200 rounded-2xl p-6 text-center space-y-2 shadow-xs">
             <p className="text-xs text-neutral-500">No active produce listed yet.</p>
             <button
-              onClick={onOpenAddProduce}
-              className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold cursor-pointer"
+              onClick={verificationPending ? undefined : onOpenAddProduce}
+              disabled={verificationPending}
+              title={verificationPending ? 'Locked — pending DA Admin approval' : undefined}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold ${
+                verificationPending
+                  ? 'bg-neutral-200 text-neutral-500 cursor-not-allowed'
+                  : 'bg-emerald-600 hover:bg-emerald-500 text-white cursor-pointer'
+              }`}
             >
-              List Your First Crop
+              {verificationPending ? 'Listing Locked — Pending Approval' : 'List Your First Crop'}
             </button>
           </div>
         ) : (

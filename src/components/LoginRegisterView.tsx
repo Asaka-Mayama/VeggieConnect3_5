@@ -1,8 +1,27 @@
 import React, { useState } from 'react';
-import { Sprout, ShoppingBag, Lock, Phone, Mail, MapPin, User, ArrowRight, CheckCircle2, AlertCircle, Shield } from 'lucide-react';
+import {
+  Sprout,
+  ShoppingBag,
+  Lock,
+  Phone,
+  Mail,
+  MapPin,
+  User,
+  ArrowRight,
+  CheckCircle2,
+  AlertCircle,
+  Shield,
+  IdCard,
+  ImagePlus,
+  FileImage,
+  Trash2,
+  Clock3,
+} from 'lucide-react';
 import { UserRole, UserProfile } from '../types';
 import { AddressMapPickerModal } from './AddressMapPickerModal';
 import { ThemeToggleButton } from './ThemeToggleButton';
+import { fileToChatPhotoDataUrl } from '../utils/chatImage';
+import { describeDocFileError, isValidRsbsaNumber, RSBSA_FORMAT_HINT } from '../utils/verification';
 
 interface LoginRegisterViewProps {
   onLoginSuccess: (user: UserProfile) => void;
@@ -14,6 +33,118 @@ function normalizePhone(p?: string): string {
   if (!p) return '';
   return p.replace(/[\s\-\+\(\)]/g, '').replace(/^63/, '0');
 }
+
+interface DocumentUploadFieldProps {
+  inputId: string;
+  label: string;
+  required?: boolean;
+  helperText?: string;
+  /** Error shown under the field (file type/size validation). */
+  error?: string | null;
+  /** Compressed data URL of the picked photo — drives the preview thumbnail. */
+  preview: string;
+  onPickFile: (file: File | null) => void;
+  onRemove: () => void;
+  /** Green (farmer scope) vs blue (buyer scope) accent for the selected state. */
+  tone?: 'farmer' | 'buyer' | 'neutral';
+}
+
+// Shared upload tile for the registration documents (Valid ID / Business
+// Proof). Accepts .jpg/.jpeg/.png up to 5MB and shows a preview thumbnail
+// once a photo has been selected.
+const DocumentUploadField: React.FC<DocumentUploadFieldProps> = ({
+  inputId,
+  label,
+  required,
+  helperText,
+  error,
+  preview,
+  onPickFile,
+  onRemove,
+  tone = 'neutral',
+}) => {
+  const toneClasses =
+    tone === 'farmer'
+      ? 'border-emerald-300 bg-emerald-50/40 hover:border-emerald-500'
+      : tone === 'buyer'
+      ? 'border-sky-300 bg-sky-50/40 hover:border-sky-500'
+      : 'border-emerald-200 bg-emerald-50/40 hover:border-emerald-500';
+
+  return (
+    <div>
+      <label className="block text-xs font-semibold text-emerald-950 mb-1">
+        {label} {required && <span className="text-red-500">*</span>}
+      </label>
+
+      {preview ? (
+        <div className="relative rounded-2xl border border-emerald-200 bg-white overflow-hidden">
+          <div className="flex items-center gap-2.5 p-2.5">
+            <img
+              src={preview}
+              alt={`${label} preview`}
+              className="w-16 h-16 rounded-xl object-cover border border-neutral-200 flex-shrink-0"
+            />
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-bold text-emerald-800 flex items-center gap-1">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0" />
+                Document attached
+              </p>
+              <p className="text-[10px] text-neutral-500 mt-0.5">
+                .jpg / .jpeg / .png — max 5MB · ready for DA review
+              </p>
+              <button
+                type="button"
+                id={`${inputId}-remove`}
+                onClick={onRemove}
+                className="mt-1.5 inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-600 border border-rose-200 text-[10px] font-bold cursor-pointer transition-colors"
+              >
+                <Trash2 className="w-3 h-3" />
+                <span>Remove photo</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <label
+          htmlFor={inputId}
+          className={`flex items-center gap-2.5 w-full rounded-2xl border border-dashed py-3 px-3 cursor-pointer transition-colors ${toneClasses}`}
+        >
+          <span className="w-9 h-9 rounded-xl bg-white border border-neutral-200 flex items-center justify-center flex-shrink-0">
+            <ImagePlus className="w-4.5 h-4.5 text-emerald-600" />
+          </span>
+          <span className="min-w-0">
+            <span className="block text-[11px] font-bold text-neutral-800">
+              Upload photo (.jpg / .jpeg / .png)
+            </span>
+            <span className="block text-[10px] text-neutral-500 mt-0.5">
+              {helperText || 'Tap to choose a clear photo — max 5MB'}
+            </span>
+          </span>
+        </label>
+      )}
+
+      <input
+        id={inputId}
+        type="file"
+        accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files && e.target.files.length > 0 ? e.target.files[0] : null;
+          onPickFile(file);
+          // Allow re-picking the same file after a removal.
+          e.target.value = '';
+        }}
+      />
+
+      {error && (
+        <p className="text-[10px] text-red-600 font-semibold mt-1 flex items-center gap-1">
+          <AlertCircle className="w-3 h-3 flex-shrink-0" />
+          {error}
+        </p>
+      )}
+    </div>
+  );
+};
 
 export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
   onLoginSuccess,
@@ -48,6 +179,49 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
   const [regLocation, setRegLocation] = useState('Dumaguete City, Negros Oriental');
   const [regFarmName, setRegFarmName] = useState('');
   const [regError, setRegError] = useState<string | null>(null);
+
+  // Account that was just submitted for DA verification. When set, the
+  // register tab shows a "Registration Submitted" success screen INSTEAD of
+  // logging the user in — the DA Admin must approve the registration (after
+  // reviewing the documents) before the account can log in at all.
+  const [submittedUser, setSubmittedUser] = useState<UserProfile | null>(null);
+
+  // DA verification documents:
+  //  - Valid Government ID  — REQUIRED for BOTH roles (jpg/jpeg/png ≤ 5MB)
+  //  - RSBSA Number         — Farmer only, OPTIONAL (validated only when filled)
+  //  - Small Business Proof — Buyer only, OPTIONAL (Barangay Clearance / DTI / Permit)
+  const [regValidIdPreview, setRegValidIdPreview] = useState('');
+  const [regValidIdError, setRegValidIdError] = useState<string | null>(null);
+  const [regRsbsa, setRegRsbsa] = useState('');
+  const [regBusinessProofPreview, setRegBusinessProofPreview] = useState('');
+  const [regBusinessProofError, setRegBusinessProofError] = useState<string | null>(null);
+  const [isCompressingDoc, setIsCompressingDoc] = useState(false);
+
+  const pickDocument = async (
+    file: File | null,
+    setPreview: (v: string) => void,
+    setError: (v: string | null) => void
+  ) => {
+    if (!file) return;
+    const fileError = describeDocFileError(file);
+    if (fileError) {
+      setError(fileError);
+      return;
+    }
+    setError(null);
+    setIsCompressingDoc(true);
+    try {
+      // Downscale to a bandwidth-friendly JPEG data URL so the document
+      // survives localStorage, the in-memory API store and the XAMPP MySQL
+      // LONGTEXT columns without bloating the payload.
+      const dataUrl = await fileToChatPhotoDataUrl(file, 1280, 0.78);
+      setPreview(dataUrl);
+    } catch (e: any) {
+      setError(e?.message || 'Could not read the selected image.');
+    } finally {
+      setIsCompressingDoc(false);
+    }
+  };
 
   // MAP-REQUIRED REGISTRATION: the account can ONLY be created after the user
   // pins their exact location on the Google Map. A typed address alone is not
@@ -100,7 +274,15 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
       const data = await resp.json();
 
       if (!resp.ok) {
-        setLoginError('incorrect password or username');
+        // Pending / Rejected registrations get their dedicated explainer from
+        // the server — the DA Admin approves the registration BEFORE the
+        // account may log in. Every other failure keeps the original
+        // generic login error.
+        if (data?.status === 'pending_verification' || data?.status === 'rejected') {
+          setLoginError(data.error);
+        } else {
+          setLoginError('incorrect password or username');
+        }
         setIsSubmitting(false);
         return;
       }
@@ -143,7 +325,15 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
       longitude: pin.lng,
       farmName: selectedRole === 'farmer' ? regFarmName.trim() : undefined,
       avatar: '',
-      verified: true,
+      // DA verification workflow: NO immediate transactional access. The
+      // account enters the Admin Console's Pending User Verifications queue
+      // and only an explicit Approve unlocks harvesting / ordering.
+      verificationStatus: 'Pending',
+      submittedAt: new Date().toISOString(),
+      validIdImage: regValidIdPreview,
+      rsbsaNumber: selectedRole === 'farmer' ? regRsbsa.trim() : undefined,
+      businessProofImage: selectedRole === 'buyer' ? regBusinessProofPreview : undefined,
+      verified: false,
       status: 'active',
     };
 
@@ -177,8 +367,11 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
       setIsSubmitting(false);
     }
 
+    // DO NOT log the user in. The registration is only a submission — the
+    // DA Admin checks the uploaded documents in the Admin Console and the
+    // account can log in ONLY after an explicit Approve.
     saveRegisteredUser(registeredUser);
-    onLoginSuccess(registeredUser);
+    setSubmittedUser(registeredUser);
   };
 
   const handleRegister = async (e: React.FormEvent) => {
@@ -206,6 +399,20 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
     }
     if (selectedRole === 'farmer' && !regFarmName.trim()) {
       setRegError('Please enter your Farm name.');
+      return;
+    }
+
+    // MANDATORY VERIFICATION FIELD (both roles): a Valid Government ID photo
+    // must be attached before the registration can be submitted for review.
+    if (!regValidIdPreview) {
+      setRegError('A Valid Government ID photo is required — upload a clear .jpg/.jpeg/.png image (max 5MB) to submit your registration.');
+      return;
+    }
+
+    // Farmer role-specific: RSBSA Number is OPTIONAL — the format is only
+    // validated when the farmer actually types something in.
+    if (selectedRole === 'farmer' && regRsbsa.trim() && !isValidRsbsaNumber(regRsbsa)) {
+      setRegError(`The RSBSA Number looks invalid. ${RSBSA_FORMAT_HINT}, or leave the field empty.`);
       return;
     }
 
@@ -308,6 +515,7 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
             id="btn-intro-get-started"
             onClick={() => {
               setActiveTab('register');
+              setSubmittedUser(null);
               setLoginError(null);
               setRegError(null);
             }}
@@ -321,6 +529,7 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
             id="btn-intro-login"
             onClick={() => {
               setActiveTab('login');
+              setSubmittedUser(null);
               setLoginError(null);
               setRegError(null);
             }}
@@ -360,6 +569,7 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
           id="tab-login"
           onClick={() => {
             setActiveTab('login');
+            setSubmittedUser(null);
             setLoginError(null);
             setRegError(null);
           }}
@@ -375,6 +585,7 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
           id="tab-register"
           onClick={() => {
             setActiveTab('register');
+            setSubmittedUser(null);
             setLoginError(null);
             setRegError(null);
           }}
@@ -457,6 +668,7 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
                 type="button"
                 onClick={() => {
                   setActiveTab('register');
+                  setSubmittedUser(null);
                   setLoginError(null);
                 }}
                 className="text-emerald-700 hover:underline font-bold cursor-pointer"
@@ -468,8 +680,8 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
         </form>
       )}
 
-      {/* REGISTER FORM */}
-      {activeTab === 'register' && (
+      {/* REGISTRATION FORM */}
+      {activeTab === 'register' && !submittedUser && (
         <form onSubmit={handleRegister} className="space-y-4 bg-white border border-emerald-100/90 rounded-3xl p-5 shadow-sm">
           <div className="border-b border-emerald-100 pb-3">
             <h2 className="text-base font-bold text-emerald-950">Create New Account</h2>
@@ -637,36 +849,117 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
             </p>
           </div>
 
+          {/* MANDATORY VERIFICATION DOCUMENT — Valid Government ID (both roles).
+              Placed directly below Location / Municipality per the DA spec. */}
+          <DocumentUploadField
+            inputId="input-reg-valid-id"
+            label="Valid Government ID"
+            required
+            tone={selectedRole === 'buyer' ? 'buyer' : 'farmer'}
+            helperText={
+              isCompressingDoc
+                ? 'Processing photo…'
+                : 'Required: clear photo of a government ID (.jpg/.jpeg/.png, max 5MB)'
+            }
+            preview={regValidIdPreview}
+            error={regValidIdError}
+            onPickFile={(file) => pickDocument(file, setRegValidIdPreview, setRegValidIdError)}
+            onRemove={() => {
+              setRegValidIdPreview('');
+              setRegValidIdError(null);
+            }}
+          />
+          <p className="-mt-2 text-[10px] text-neutral-500 flex items-start gap-1">
+            <IdCard className="w-3 h-3 text-emerald-600 flex-shrink-0 mt-0.5" />
+            <span>
+              Your registration will be reviewed by the DA Admin. You can log in only after the admin has verified your documents and approved your registration.
+            </span>
+          </p>
+
           {/* Role-specific fields */}
           {selectedRole === 'farmer' && (
-            <div>
-              <label className="block text-xs font-semibold text-emerald-800 mb-1">
-                Farm Name <span className="text-red-500">*</span>
-              </label>
-              <div className="relative">
-                <Sprout className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
-                <input
-                  id="input-reg-farm"
-                  type="text"
-                  placeholder="e.g. Valencia Highland Organic Farm"
-                  value={regFarmName}
-                  onChange={(e) => setRegFarmName(e.target.value)}
-                  className="w-full bg-emerald-50/40 border border-emerald-300 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
-                  required
-                />
+            <>
+              <div>
+                <label className="block text-xs font-semibold text-emerald-800 mb-1">
+                  Farm Name <span className="text-red-500">*</span>
+                </label>
+                <div className="relative">
+                  <Sprout className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+                  <input
+                    id="input-reg-farm"
+                    type="text"
+                    placeholder="e.g. Valencia Highland Organic Farm"
+                    value={regFarmName}
+                    onChange={(e) => setRegFarmName(e.target.value)}
+                    className="w-full bg-emerald-50/40 border border-emerald-300 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
+                    required
+                  />
+                </div>
               </div>
-            </div>
+
+              {/* RSBSA Number — OPTIONAL: only validated when a value is entered */}
+              <div>
+                <label className="block text-xs font-semibold text-emerald-800 mb-1">
+                  RSBSA Number (Optional)
+                </label>
+                <div className="relative">
+                  <FileImage className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+                  <input
+                    id="input-reg-rsbsa"
+                    type="text"
+                    placeholder="e.g. 07-46-10-001-000001 (Optional)"
+                    value={regRsbsa}
+                    onChange={(e) => setRegRsbsa(e.target.value)}
+                    className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:border-emerald-600 focus:bg-white"
+                  />
+                </div>
+                <p className="text-[10px] text-neutral-500 mt-1 flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-600 flex-shrink-0" />
+                  Registry Number for Basic Sector in Agriculture — earn a <span className="font-bold">“DA Registered”</span> badge once approved
+                </p>
+              </div>
+            </>
+          )}
+
+          {selectedRole === 'buyer' && (
+            <DocumentUploadField
+              inputId="input-reg-business-proof"
+              label="Small Business Proof (Optional)"
+              tone="buyer"
+              helperText={
+                isCompressingDoc
+                  ? 'Processing photo…'
+                  : 'Optional: Barangay Clearance, DTI, or Business Permit for small businesses'
+              }
+              preview={regBusinessProofPreview}
+              error={regBusinessProofError}
+              onPickFile={(file) => pickDocument(file, setRegBusinessProofPreview, setRegBusinessProofError)}
+              onRemove={() => {
+                setRegBusinessProofPreview('');
+                setRegBusinessProofError(null);
+              }}
+            />
           )}
 
           <button
             id="btn-submit-register"
             type="submit"
-            disabled={isSubmitting}
-            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md shadow-emerald-700/20 flex items-center justify-center gap-2 transition-all active:scale-[0.98] mt-2 cursor-pointer"
+            disabled={isSubmitting || isCompressingDoc}
+            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md shadow-emerald-700/20 flex items-center justify-center gap-2 transition-all active:scale-[0.98] mt-2 cursor-pointer disabled:opacity-70 disabled:cursor-not-allowed"
           >
-            <span>{isSubmitting ? 'Registering...' : 'Create Account & Enter'}</span>
-            <CheckCircle2 className="w-4 h-4" />
+            <span>
+              {isSubmitting
+                ? 'Submitting Registration…'
+                : isCompressingDoc
+                ? 'Processing document…'
+                : 'Submit Registration for Verification'}
+            </span>
+            <Clock3 className="w-4 h-4" />
           </button>
+
+          <p className="text-center text-[10px] text-neutral-500 -mt-1.5">
+            <Shield className="w-3 h-3 inline text-emerald-600" /> You can log in only after the DA Admin verifies your Valid ID and approves your registration.
+          </p>
 
           <div className="text-center pt-2">
             <p className="text-xs text-neutral-500">
@@ -675,6 +968,7 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
                 type="button"
                 onClick={() => {
                   setActiveTab('login');
+                  setSubmittedUser(null);
                   setRegError(null);
                 }}
                 className="text-emerald-700 hover:underline font-bold cursor-pointer"
@@ -686,9 +980,68 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
         </form>
       )}
 
+      {/* REGISTRATION SUBMITTED — success screen (NO auto-login).
+          The DA Admin reviews the uploaded documents in the Admin Console's
+          Pending User Verifications queue and the account can log in ONLY
+          after the admin approves it. */}
+      {activeTab === 'register' && submittedUser && (
+        <div className="space-y-3.5 bg-white border border-emerald-100/90 rounded-3xl p-5 shadow-sm text-center">
+          <div className="w-16 h-16 mx-auto rounded-full bg-emerald-100 border border-emerald-200 flex items-center justify-center">
+            <CheckCircle2 className="w-9 h-9 text-emerald-600" />
+          </div>
+          <div>
+            <h2 className="text-base font-black text-emerald-950">Registration Submitted</h2>
+            <p className="text-xs text-neutral-600 leading-relaxed mt-1">
+              Thank you, <span className="font-bold">{submittedUser.name}</span>! Your{' '}
+              <span className="font-bold capitalize">{submittedUser.role}</span> account has been sent to the DA Admin for verification.
+            </p>
+          </div>
+
+          <div className="rounded-2xl border border-amber-200 bg-amber-50 p-3 text-left flex items-start gap-2">
+            <Clock3 className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+            <p className="text-[11px] text-amber-900 leading-relaxed">
+              <span className="font-black">Pending Admin Approval.</span> The DA Admin will now check your documents — your Valid
+              Government ID
+              {submittedUser.role === 'farmer' && submittedUser.rsbsaNumber ? ', RSBSA Number' : ''}
+              {submittedUser.role === 'buyer' && submittedUser.businessProofImage ? ' and Small Business Proof' : ''}.
+              You can log in ONLY after the admin approves your registration.
+            </p>
+          </div>
+
+          <p className="text-[10px] text-neutral-500 leading-relaxed">
+            Keep your mobile number (<span className="font-mono">{submittedUser.phone}</span>) and password safe — you will use
+            them to log in once the admin has approved your account.
+          </p>
+
+          <button
+            id="btn-submitted-goto-login"
+            type="button"
+            onClick={() => {
+              setSubmittedUser(null);
+              setActiveTab('login');
+              setRegError(null);
+              setLoginError(null);
+            }}
+            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md shadow-emerald-700/20 flex items-center justify-center gap-2 transition-all active:scale-[0.98] cursor-pointer"
+          >
+            <span>Go to Log In</span>
+            <ArrowRight className="w-4 h-4" />
+          </button>
+
+          <button
+            id="btn-submitted-register-another"
+            type="button"
+            onClick={() => setSubmittedUser(null)}
+            className="w-full py-2.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 font-bold text-xs rounded-xl transition-colors cursor-pointer"
+          >
+            Register another account
+          </button>
+        </div>
+      )}
+
       {/* Subtle build marker — lets the owner confirm which build is running. */}
       <p className="text-center text-[10px] text-neutral-400 pt-5 pb-1 select-none">
-        VeggieConnect · Build v3.2.1
+        VeggieConnect · Build v3.7 (DA Verification Queue • Admin Approval Before Login • Valid Government ID Upload • RSBSA &amp; Business Proof)
       </p>
     </div>
 

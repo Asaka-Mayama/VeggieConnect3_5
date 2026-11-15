@@ -1,7 +1,8 @@
 import React, { useState, useRef, useMemo } from 'react';
-import { X, Sprout, Sparkles, Upload, Camera, CheckCircle2, AlertCircle, TrendingUp, Info } from 'lucide-react';
+import { X, Sprout, Sparkles, Upload, Camera, CheckCircle2, AlertCircle, TrendingUp, Info, Search } from 'lucide-react';
 import { ProduceItem } from '../types';
 import { findMatchingDAPrice } from '../data/daPricesData';
+import { getProduceSuggestions, ProduceSuggestion } from '../data/produceSuggestions';
 import { DAPriceWatchModal } from './DAPriceWatchModal';
 
 interface AddProduceModalProps {
@@ -65,6 +66,37 @@ export const AddProduceModal: React.FC<AddProduceModalProps> = ({
     return findMatchingDAPrice(name);
   }, [name]);
   const [showDABulletinModal, setShowDABulletinModal] = useState(false);
+
+  // Produce Name autocomplete — suggestions from the DA crop catalog plus
+  // common Negros Oriental backyard crops. Typing "S" surfaces Sitaw,
+  // Sayote, Patola (Sponge Gourd), Squash, Siling Labuyo, etc.
+  const nameSuggestions = useMemo(() => getProduceSuggestions(name), [name]);
+  const [showNameSuggestions, setShowNameSuggestions] = useState(false);
+  const [nameHighlight, setNameHighlight] = useState(0);
+
+  const selectNameSuggestion = (s: ProduceSuggestion) => {
+    setName(s.name);
+    setShowNameSuggestions(false);
+    setNameHighlight(0);
+  };
+
+  const handleNameKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Escape') {
+      setShowNameSuggestions(false);
+      return;
+    }
+    if (!showNameSuggestions || nameSuggestions.length === 0) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setNameHighlight((i) => (i + 1) % nameSuggestions.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setNameHighlight((i) => (i - 1 + nameSuggestions.length) % nameSuggestions.length);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      selectNameSuggestion(nameSuggestions[Math.min(nameHighlight, nameSuggestions.length - 1)]);
+    }
+  };
 
   const handleSmartPriceSuggest = () => {
     if (matchedDAPrice) {
@@ -341,20 +373,76 @@ export const AddProduceModal: React.FC<AddProduceModalProps> = ({
             )}
           </div>
 
-          {/* Produce Name */}
+          {/* Produce Name — with autocomplete suggestions from the DA crop catalog */}
           <div className="space-y-1">
-            <label className="text-xs font-bold text-neutral-800">
+            <label className="text-xs font-bold text-neutral-800 flex items-center gap-1">
+              <Search className="w-3 h-3 text-emerald-600" />
               Produce Name *
             </label>
-            <input
-              id="input-produce-name"
-              type="text"
-              required
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Fresh Native Tomatoes, Ampalaya, Sitaw..."
-              className="w-full bg-neutral-50 border border-neutral-300 rounded-xl px-3 py-2 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:bg-white focus:border-emerald-600"
-            />
+            <div className="relative">
+              <input
+                id="input-produce-name"
+                type="text"
+                required
+                value={name}
+                autoComplete="off"
+                onChange={(e) => {
+                  setName(e.target.value);
+                  setShowNameSuggestions(true);
+                  setNameHighlight(0);
+                }}
+                onFocus={() => setShowNameSuggestions(true)}
+                onBlur={() => setShowNameSuggestions(false)}
+                onKeyDown={handleNameKeyDown}
+                placeholder="Type 'S' → Sitaw, Sayote, Patola..."
+                className="w-full bg-neutral-50 border border-neutral-300 rounded-xl px-3 py-2 text-xs text-neutral-900 placeholder-neutral-400 focus:outline-none focus:bg-white focus:border-emerald-600"
+              />
+
+              {/* Suggestion dropdown */}
+              {showNameSuggestions && nameSuggestions.length > 0 && (
+                <div
+                  id="produce-name-suggestions"
+                  className="absolute left-0 right-0 top-full mt-1 z-30 bg-white border border-neutral-200 rounded-xl shadow-xl overflow-hidden animate-in fade-in zoom-in-95 duration-100"
+                >
+                  <div className="max-h-52 overflow-y-auto">
+                    {nameSuggestions.map((s, idx) => (
+                      <button
+                        key={s.name}
+                        type="button"
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          selectNameSuggestion(s);
+                        }}
+                        onMouseEnter={() => setNameHighlight(idx)}
+                        className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 transition-colors cursor-pointer border-b border-neutral-100 last:border-b-0 ${
+                          idx === nameHighlight ? 'bg-emerald-50' : 'bg-white'
+                        }`}
+                      >
+                        <span className="min-w-0">
+                          <span className="block text-xs font-bold text-neutral-900 truncate">{s.name}</span>
+                          <span className="block text-[10px] text-neutral-500 truncate">{s.alias}</span>
+                        </span>
+                        {s.daListed && s.daSuggested != null && (
+                          <span className="flex-shrink-0 text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 rounded-full px-2 py-0.5 whitespace-nowrap">
+                            DA ₱{s.daSuggested.toFixed(2)}/kg
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="px-3 py-1.5 bg-neutral-50 border-t border-neutral-200 text-[9px] text-neutral-500 flex items-center gap-1">
+                    <Sparkles className="w-2.5 h-2.5 text-emerald-600 flex-shrink-0" />
+                    <span>Tap a crop to autofill — DA-listed crops get the official price guide</span>
+                  </div>
+                </div>
+              )}
+
+              {showNameSuggestions && name.trim() !== '' && nameSuggestions.length === 0 && (
+                <div className="absolute left-0 right-0 top-full mt-1 z-30 bg-white border border-neutral-200 rounded-xl shadow-lg px-3 py-2 text-[10px] text-neutral-500">
+                  No catalog match — you can still submit this crop name as-is.
+                </div>
+              )}
+            </div>
           </div>
 
           {/* Price (per kg only) */}

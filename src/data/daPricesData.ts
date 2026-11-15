@@ -733,6 +733,12 @@ export function findMatchingDAPrice(searchName: string): DAPriceItem | undefined
   if (clean.includes('baguio bean') || clean.includes('snap bean') || clean.includes('habitchuelas')) {
     return DA_DAILY_PRICES.find((i) => i.id === 'da-baguio-beans');
   }
+  if (clean.includes('patola') || clean.includes('sponge gourd') || clean.includes('luffa')) {
+    return DA_DAILY_PRICES.find((i) => i.id === 'da-patola');
+  }
+  if (clean.includes('upo') || clean.includes('bottle gourd')) {
+    return DA_DAILY_PRICES.find((i) => i.id === 'da-upo');
+  }
   if (clean.includes('squash') || clean.includes('kalabasa') || clean.includes('kabotcha')) {
     return DA_DAILY_PRICES.find((i) => i.id === 'da-squash');
   }

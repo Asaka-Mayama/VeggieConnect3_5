@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Wifi, Battery, Signal, Store, Sprout, ClipboardList, MessageSquare, User } from 'lucide-react';
+import { Wifi, Battery, Signal, Store, Sprout, ClipboardList, MessageSquare, User, ShoppingBag, Wallet } from 'lucide-react';
 import { UserRole } from '../types';
 
 interface MobileFrameProps {
@@ -18,6 +18,7 @@ export const MobileFrame: React.FC<MobileFrameProps> = ({
   activeTab,
   setActiveTab,
   userRole,
+  cartCount,
   ordersCount,
   unreadMessagesCount,
   isLoggedIn = true,
@@ -41,13 +42,14 @@ export const MobileFrame: React.FC<MobileFrameProps> = ({
   const isAdmin = userRole === 'admin';
 
   // Define tab navigation order for swipe gesture transitions
-  // NOTE: Buyers have NO Cart tab — the Market is request-only. Buyer requests
-  // are tracked in the Orders tab (Request Submitted → Fulfillment).
+  // Buyers get a Cart tab so they can stage products they still need to
+  // order before submitting the final purchase request, and a Wallet tab
+  // to deposit money and pay approved orders.
   const getTabsForRole = () => {
     if (userRole === 'farmer') {
       return ['farmer-portal', 'orders', 'messages', 'profile'];
     }
-    return ['market', 'orders', 'messages', 'profile'];
+    return ['market', 'cart', 'wallet', 'orders', 'messages', 'profile'];
   };
 
   const handleTouchStart = (e: React.TouchEvent) => {
@@ -84,12 +86,12 @@ export const MobileFrame: React.FC<MobileFrameProps> = ({
   };
 
   return (
-    <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col items-center justify-center p-0 sm:p-4 selection:bg-emerald-600 selection:text-white">
+    <div className="min-h-screen bg-neutral-100 text-neutral-900 flex flex-col items-center justify-center p-0 min-[460px]:p-4 selection:bg-emerald-600 selection:text-white">
       {/* Mobile App Shell (Pure Mobile App Form Factor) */}
       <div
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
-        className="w-full max-w-[430px] h-[100dvh] sm:h-[min(920px,calc(100dvh_-_2rem))] bg-white sm:rounded-[44px] sm:border-[10px] sm:border-neutral-800/10 sm:shadow-[0_20px_50px_rgba(0,0,0,0.12)] relative flex flex-col overflow-hidden"
+        className="w-full max-w-[430px] h-[100dvh] min-[460px]:h-[min(920px,calc(100dvh_-_2rem))] bg-white min-[460px]:rounded-[44px] min-[460px]:border-[10px] min-[460px]:border-neutral-800/10 min-[460px]:shadow-[0_20px_50px_rgba(0,0,0,0.12)] relative flex flex-col overflow-hidden"
       >
         {/* Smartphone Hardware Status Bar */}
         <div className="w-full bg-white/95 backdrop-blur-md z-30 pt-2.5 px-6 pb-1.5 flex items-center justify-between text-xs font-bold text-neutral-900 select-none border-b border-neutral-200/80">
@@ -148,6 +150,30 @@ export const MobileFrame: React.FC<MobileFrameProps> = ({
                 </button>
               )}
 
+              {/* Cart Tab: ONLY shown for buyers — stage products before
+                  submitting the purchase request */}
+              {userRole === 'buyer' && (
+                <button
+                  id="nav-tab-cart"
+                  onClick={() => setActiveTab('cart')}
+                  className={`flex flex-col items-center justify-center min-h-[50px] min-w-[56px] py-1 px-2.5 rounded-2xl transition-all relative cursor-pointer active:scale-95 ${
+                    activeTab === 'cart'
+                      ? 'bg-emerald-100 text-emerald-900 font-bold shadow-xs'
+                      : 'text-neutral-500 hover:text-emerald-800 font-medium'
+                  }`}
+                >
+                  <div className="relative">
+                    <ShoppingBag className="w-5 h-5 mb-0.5" />
+                    {cartCount > 0 && (
+                      <span className="absolute -top-1 -right-1.5 bg-emerald-600 text-white text-[9px] font-bold rounded-full w-4 h-4 flex items-center justify-center shadow-xs">
+                        {cartCount > 99 ? '99+' : cartCount}
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-[10px] tracking-tight">Cart</span>
+                </button>
+              )}
+
               {userRole === 'farmer' && (
                 <button
                   id="nav-tab-farmer-portal"
@@ -164,6 +190,25 @@ export const MobileFrame: React.FC<MobileFrameProps> = ({
                     </div>
                   </div>
                   <span className="text-[10px] tracking-tight">My Crops</span>
+                </button>
+              )}
+
+              {/* Wallet Tab: ONLY shown for buyers — deposit money (prototype)
+                  and pay approved orders before the live transaction */}
+              {userRole === 'buyer' && (
+                <button
+                  id="nav-tab-wallet"
+                  onClick={() => setActiveTab('wallet')}
+                  className={`flex flex-col items-center justify-center min-h-[50px] min-w-[50px] py-1 px-1.5 rounded-2xl transition-all relative cursor-pointer active:scale-95 ${
+                    activeTab === 'wallet'
+                      ? 'bg-emerald-100 text-emerald-900 font-bold shadow-xs'
+                      : 'text-neutral-500 hover:text-emerald-800 font-medium'
+                  }`}
+                >
+                  <div className="relative">
+                    <Wallet className="w-5 h-5 mb-0.5" />
+                  </div>
+                  <span className="text-[10px] tracking-tight">Wallet</span>
                 </button>
               )}
 

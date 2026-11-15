@@ -62,6 +62,11 @@ CREATE TABLE \`users\` (
   \`avatar_url\` VARCHAR(255) DEFAULT NULL,
   \`status\` ENUM('active', 'pending', 'suspended') NOT NULL DEFAULT 'active',
   \`is_verified\` TINYINT(1) NOT NULL DEFAULT 1,
+  \`verification_status\` VARCHAR(20) NOT NULL DEFAULT 'Pending',
+  \`valid_id_image\` LONGTEXT DEFAULT NULL,
+  \`rsbsa_number\` VARCHAR(60) DEFAULT NULL,
+  \`business_proof_image\` LONGTEXT DEFAULT NULL,
+  \`submitted_at\` VARCHAR(100) DEFAULT NULL,
   \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (\`id\`),
   UNIQUE KEY \`unique_email\` (\`email\`)
@@ -220,8 +225,8 @@ CREATE TABLE \`da_price_bulletin\` (
 -- Initial Seed Data: Default Admin User (The Seller)
 -- Password: set ADMIN_PASSWORD in the .env file (not stored here)
 -- --------------------------------------------------------
-INSERT INTO \`users\` (\`id\`, \`name\`, \`email\`, \`password_hash\`, \`phone\`, \`role\`, \`location\`, \`farm_name\`, \`avatar_url\`, \`status\`, \`is_verified\`) VALUES
-('admin-main', 'VeggieConnect Seller Desk', 'admin@gmail.com', '8f94e6b12a:1849a9fb92a', '+63 900 000 0000', 'admin', 'Dumaguete City Proper (Central Supermarket Depot)', NULL, '', 'active', 1)
+INSERT INTO \`users\` (\`id\`, \`name\`, \`email\`, \`password_hash\`, \`phone\`, \`role\`, \`location\`, \`farm_name\`, \`avatar_url\`, \`status\`, \`is_verified\`, \`verification_status\`, \`valid_id_image\`, \`rsbsa_number\`, \`business_proof_image\`, \`submitted_at\`) VALUES
+('admin-main', 'VeggieConnect Seller Desk', 'admin@gmail.com', '8f94e6b12a:1849a9fb92a', '+63 900 000 0000', 'admin', 'Dumaguete City Proper (Central Supermarket Depot)', NULL, '', 'active', 1, 'Approved', '', NULL, NULL, NULL)
 ON DUPLICATE KEY UPDATE \`name\` = VALUES(\`name\`);
 
 -- --------------------------------------------------------

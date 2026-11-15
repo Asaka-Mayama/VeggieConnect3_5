@@ -1,9 +1,10 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { MobileFrame } from './components/MobileFrame';
 import { Header } from './components/Header';
 import { BuyerMarketView } from './components/BuyerMarketView';
 import { FarmDirectoryView } from './components/FarmDirectoryView';
 import { CartDrawer } from './components/CartDrawer';
+import { RequestCropsModal } from './components/RequestCropsModal';
 import { OrdersView } from './components/OrdersView';
 import { FarmerDashboardView } from './components/FarmerDashboardView';
 import { ProduceDetailModal } from './components/ProduceDetailModal';
@@ -14,6 +15,7 @@ import { LoginRegisterView } from './components/LoginRegisterView';
 import { EditProfileModal } from './components/EditProfileModal';
 import { AdminApp } from './components/AdminApp';
 import { ProfileMenuView } from './components/ProfileMenuView';
+import { WalletView } from './components/WalletView';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { DAPriceWatchModal } from './components/DAPriceWatchModal';
 import { AddressMapPickerModal } from './components/AddressMapPickerModal';
@@ -22,8 +24,10 @@ import { calculateDistanceKm, calculateDistanceBetween, resolveCoordinates } fro
 import { SUPERMARKET_STORAGE_KEY, ADMIN_HUB_STORAGE_KEY } from './utils/farmRoute';
 import { appSync } from './utils/appSync';
 import { setThemeRole } from './utils/themeStore';
+import { isVerificationPending, isVerificationRejected } from './utils/verification';
 import { INITIAL_PRODUCE, INITIAL_FARMERS, INITIAL_ORDERS, INITIAL_TRANSPORT_JOBS } from './data/mockData';
-import { ProduceItem, FarmerProfile, CartItem, Order, DirectMessage, UserRole, OrderStatus, TransportJob, UserProfile, isLiveSupermarketStock } from './types';
+import { ProduceItem, FarmerProfile, CartItem, Order, OrderItem, DirectMessage, UserRole, OrderStatus, TransportJob, UserProfile, WalletTransaction, PriceAdjustmentQuote, isLiveSupermarketStock, orderItemAmount, orderPayable } from './types';
+import { MIN_PRODUCT_KG } from './components/ProduceCard';
 import { CheckCircle, AlertCircle, Sprout, MapPin, X } from 'lucide-react';
 
 const STORAGE_KEYS = {
@@ -414,6 +418,12 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isGlobalPriceWatchOpen, setIsGlobalPriceWatchOpen] = useState(false);
   const [globalPriceWatchSearch, setGlobalPriceWatchSearch] = useState('');
+
+  // Buyer Vegetable Purchase Request modal — opened from the CART menu's
+  // "Request Crops" button (generic, clean slate) or from a product-specific
+  // "Request" tap on a Market card / detail modal (pre-filled with THAT crop).
+  const [isRequestCropsOpen, setIsRequestCropsOpen] = useState(false);
+  const [requestCropsPreset, setRequestCropsPreset] = useState<{ produce: ProduceItem; qty?: number } | null>(null);
 
   // Keep currentLocation in sync with currentUser
   useEffect(() => {
@@ -926,6 +936,29 @@ export default function App() {
     localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(registeredUsers));
   }, [registeredUsers]);
 
+  // Keep the logged-in buyer's wallet in step with the shared registry. When a
+  // refund or payment is posted from ANOTHER device (e.g. the admin refunding
+  // an unavailable product), the 2.5s /api/users poll refreshes registeredUsers
+  // and this effect mirrors the new balance + ledger into the live session.
+  useEffect(() => {
+    if (!currentUser) return;
+    const mine = registeredUsers.find((u) => u && u.id === currentUser.id);
+    if (!mine) return;
+    const remoteBalance = Math.round((Number(mine.walletBalance) || 0) * 100) / 100;
+    const localBalance = Math.round((Number(currentUser.walletBalance) || 0) * 100) / 100;
+    const remoteLedger = Array.isArray(mine.walletTransactions) ? mine.walletTransactions : [];
+    const localLedger = Array.isArray(currentUser.walletTransactions) ? currentUser.walletTransactions : [];
+    if (remoteBalance !== localBalance || remoteLedger.length !== localLedger.length) {
+      const synced: UserProfile = {
+        ...currentUser,
+        walletBalance: remoteBalance,
+        walletTransactions: remoteLedger,
+      };
+      setCurrentUser(synced);
+      localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(synced));
+    }
+  }, [registeredUsers]);
+
   // Automatic Cascading Cleanup:
   // If a farmer account is removed, automatically remove all their crop listings from the marketplace & cart
   useEffect(() => {
@@ -1000,6 +1033,423 @@ export default function App() {
     }, 2800);
   };
 
+  // ── VeggieConnect Pay wallet ──────────────────────────────────────────────
+  // All money movement flows through POST /api/users/:id/wallet so every
+  // device (buyer phone, admin desk) reads the same balance and ledger.
+  const applyWalletUserRecord = useCallback(
+    (updated: UserProfile) => {
+      if (!updated || !updated.id) return;
+      setRegisteredUsers((prev) =>
+        prev.some((u) => u.id === updated.id)
+          ? prev.map((u) => (u.id === updated.id ? { ...u, ...updated } : u))
+          : [...prev, updated]
+      );
+      setCurrentUser((me) => (me && me.id === updated.id ? { ...me, ...updated } : me));
+    },
+    []
+  );
+
+  const postWalletTransaction = useCallback(
+    async (
+      userId: string,
+      action: 'deposit' | 'payment' | 'refund',
+      amount: number,
+      description: string,
+      orderId?: string
+    ): Promise<UserProfile | null> => {
+      // Send the client's known profile along with the money movement. If the
+      // server lost the account (prototype store is not durable across
+      // restarts), it re-registers the buyer from this profile instead of
+      // failing, so Deposit / Pay / Refund keep working everywhere.
+      const profileSource =
+        registeredUsers.find((u) => u && u.id === userId) ||
+        (currentUser && currentUser.id === userId ? currentUser : null);
+      try {
+        const res = await fetch(`/api/users/${userId}/wallet`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action, amount, description, orderId, profile: profileSource }),
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok) {
+          showToast(`⚠️ ${data?.error || 'Wallet update failed'}`);
+          return null;
+        }
+        if (data?.user) {
+          applyWalletUserRecord(data.user as UserProfile);
+          return data.user as UserProfile;
+        }
+        return null;
+      } catch (e) {
+        // Offline fallback — mirror the transaction locally so the prototype
+        // keeps working without the backend.
+        const value = Math.round(amount * 100) / 100;
+        let target: UserProfile | undefined;
+        setRegisteredUsers((prev) => {
+          const next = prev.map((u) => {
+            if (u.id !== userId) return u;
+            target = u;
+            const current = Math.round((Number(u.walletBalance) || 0) * 100) / 100;
+            const nextBalance =
+              action === 'payment'
+                ? Math.max(0, Math.round((current - value) * 100) / 100)
+                : Math.round((current + value) * 100) / 100;
+            const tx: WalletTransaction = {
+              id: `wt-${Date.now()}-${Math.floor(Math.random() * 900 + 100)}`,
+              type: action,
+              amount: value,
+              balanceAfter: nextBalance,
+              description,
+              ...(orderId ? { orderId } : {}),
+              timestamp: new Date().toISOString(),
+            };
+            const merged: UserProfile = {
+              ...u,
+              walletBalance: nextBalance,
+              walletTransactions: [...(u.walletTransactions || []), tx],
+            };
+            target = merged;
+            return merged;
+          });
+          localStorage.setItem(STORAGE_KEYS.USERS, JSON.stringify(next));
+          return next;
+        });
+        setCurrentUser((me) => {
+          if (!me || me.id !== userId) return me;
+          const current = Math.round((Number(me.walletBalance) || 0) * 100) / 100;
+          const nextBalance =
+            action === 'payment'
+              ? Math.max(0, Math.round((current - value) * 100) / 100)
+              : Math.round((current + value) * 100) / 100;
+          const tx: WalletTransaction = {
+            id: `wt-${Date.now()}-${Math.floor(Math.random() * 900 + 100)}`,
+            type: action,
+            amount: value,
+            balanceAfter: nextBalance,
+            description,
+            ...(orderId ? { orderId } : {}),
+            timestamp: new Date().toISOString(),
+          };
+          const merged: UserProfile = {
+            ...me,
+            walletBalance: nextBalance,
+            walletTransactions: [...(me.walletTransactions || []), tx],
+          };
+          localStorage.setItem(STORAGE_KEYS.USER, JSON.stringify(merged));
+          return merged;
+        });
+        return target || null;
+      }
+    },
+    [applyWalletUserRecord, registeredUsers, currentUser]
+  );
+
+  // Deposit (prototype): buyer tops up their wallet from the Wallet screen.
+  const handleWalletDeposit = useCallback(
+    (amount: number) => {
+      if (!currentUser) return;
+      const value = Math.round(amount * 100) / 100;
+      if (!value || value <= 0) return;
+      void postWalletTransaction(
+        currentUser.id,
+        'deposit',
+        value,
+        'Wallet deposit (prototype top-up)'
+      ).then((updated) => {
+        if (updated) {
+          showToast(`✅ Deposited ₱${value.toLocaleString()} — new balance ₱${(Number(updated.walletBalance) || 0).toLocaleString()}`);
+        }
+      });
+    },
+    [currentUser, postWalletTransaction]
+  );
+
+  // Buyer pays an APPROVED order from the wallet. The live transaction only
+  // starts once the order is paid.
+  const handlePayOrder = useCallback(
+    (orderId: string) => {
+      if (!currentUser) return;
+      const order = orders.find((o) => o.id === orderId);
+      if (!order) return;
+      if (order.paymentStatus === 'paid') {
+        showToast('This order is already paid.');
+        return;
+      }
+      if (order.status === 'pending') {
+        showToast('⏳ The Admin has not approved this order yet — payment unlocks after approval.');
+        return;
+      }
+      if (order.status === 'cancelled') {
+        showToast('This order was cancelled — nothing to pay.');
+        return;
+      }
+      const payable = orderPayable(order);
+      if (payable <= 0) {
+        // Everything was refunded pre-payment — settle at zero.
+        setOrders((prev) => {
+          const updated = prev.map((o) =>
+            o.id === orderId
+              ? { ...o, paymentStatus: 'paid' as const, paidAt: new Date().toISOString(), paidAmount: 0 }
+              : o
+          );
+          localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(updated));
+          return updated;
+        });
+        const full = orders.find((o) => o.id === orderId);
+        if (full) {
+          fetch(`/api/orders/${orderId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...full, paymentStatus: 'paid', paidAt: new Date().toISOString(), paidAmount: 0 }),
+          }).catch(() => {});
+        }
+        appSync.publish('ORDERS_UPDATED', { id: orderId, paymentStatus: 'paid' }, 'market');
+        showToast('✅ Order settled at ₱0 — all products were refunded before payment.');
+        return;
+      }
+      const balance = Math.round((Number(currentUser.walletBalance) || 0) * 100) / 100;
+      if (balance < payable) {
+        showToast(
+          `💰 Insufficient wallet balance — ₱${payable.toLocaleString()} needed, you have ₱${balance.toLocaleString()}. Open Wallet ▸ Deposit first.`
+        );
+        return;
+      }
+      void postWalletTransaction(
+        currentUser.id,
+        'payment',
+        payable,
+        `Order payment — ${order.id}`,
+        order.id
+      ).then((updated) => {
+        if (!updated) return; // server already toasted the reason
+        setOrders((prev) => {
+          const next = prev.map((o) =>
+            o.id === orderId
+              ? { ...o, paymentStatus: 'paid' as const, paidAt: new Date().toISOString(), paidAmount: payable }
+              : o
+          );
+          localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(next));
+          return next;
+        });
+        const full = orders.find((o) => o.id === orderId);
+        if (full) {
+          fetch(`/api/orders/${orderId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              ...full,
+              paymentStatus: 'paid',
+              paidAt: new Date().toISOString(),
+              paidAmount: payable,
+            }),
+          }).catch(() => {});
+        }
+        appSync.publish('ORDERS_UPDATED', { id: orderId, paymentStatus: 'paid' }, 'market');
+        showToast(`✅ Paid ₱${payable.toLocaleString()} from wallet — live transaction unlocked!`);
+      });
+    },
+    [currentUser, orders, postWalletTransaction]
+  );
+
+  // Admin availability ruling: mark one ordered product unavailable. Its
+  // amount goes back to the buyer's wallet when the order is already paid, or
+  // is removed from the bill before payment — the order itself CONTINUES.
+  const handleMarkItemUnavailable = useCallback(
+    (orderId: string, itemIndex: number) => {
+      const order = orders.find((o) => o.id === orderId);
+      if (!order || !Array.isArray(order.items)) return;
+      const item = order.items[itemIndex];
+      if (!item || item.itemStatus === 'unavailable') return;
+
+      const refundAmount = Math.round(orderItemAmount(item) * 100) / 100;
+      const wasPaid = order.paymentStatus === 'paid';
+      const refundedAt = new Date().toISOString();
+
+      const updatedOrder: Order = {
+        ...order,
+        items: order.items.map((it, idx) =>
+          idx === itemIndex
+            ? { ...it, itemStatus: 'unavailable' as const, refundedAmount: refundAmount, refundedAt }
+            : it
+        ),
+        refundedTotal: Math.round(((Number(order.refundedTotal) || 0) + refundAmount) * 100) / 100,
+        ...(wasPaid
+          ? { refundedCredited: Math.round(((Number(order.refundedCredited) || 0) + refundAmount) * 100) / 100 }
+          : {}),
+      };
+
+      setOrders((prev) => {
+        const next = prev.map((o) => (o.id === orderId ? updatedOrder : o));
+        localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(next));
+        return next;
+      });
+      fetch(`/api/orders/${orderId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedOrder),
+      }).catch(() => {});
+      appSync.publish('ORDERS_UPDATED', updatedOrder, 'admin');
+
+      if (wasPaid && refundAmount > 0) {
+        const buyerId = order.buyerId;
+        if (buyerId) {
+          void postWalletTransaction(
+            buyerId,
+            'refund',
+            refundAmount,
+            `Refund — ${item.produceName} unavailable (Order ${orderId})`,
+            orderId
+          ).then((updated) => {
+            if (updated) {
+              showToast(
+                `↩️ ₱${refundAmount.toLocaleString()} refunded to ${order.buyerName}'s wallet for ${item.produceName}. Order continues with the remaining products.`
+              );
+            }
+          });
+        } else {
+          showToast(
+            `↩️ ${item.produceName} marked unavailable (₱${refundAmount.toLocaleString()}). Order continues with the remaining products.`
+          );
+        }
+      } else {
+        showToast(
+          `⚠️ ${item.produceName} marked unavailable — ₱${refundAmount.toLocaleString()} removed from the bill. Order continues with the remaining products.`
+        );
+      }
+    },
+    [orders, postWalletTransaction]
+  );
+
+  // ── Price Adjustment Quotes (loss prevention) ─────────────────────────────
+  // Farmers sometimes ask MORE than the fixed buyer market price (DA direct
+  // × 1.10) during a supply shortage. Automatic fulfillment is blocked in
+  // that case; the Admin sends the buyer a Price Adjustment Quote — new
+  // buyer price = new farmgate × 1.10 — and only buys from farmers after the
+  // buyer approves it.
+  const handleSendPriceQuote = useCallback(
+    (orderId: string, quote: PriceAdjustmentQuote) => {
+      let orderSnapshot: Order | undefined;
+      setOrders((prev) => {
+        const next = prev.map((o) => {
+          if (o.id !== orderId) return o;
+          orderSnapshot = o;
+          return {
+            ...o,
+            priceQuotes: [...(o.priceQuotes || []).filter((q) => q.id !== quote.id), quote],
+          };
+        });
+        localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(next));
+        return next;
+      });
+      const target = orderSnapshot || orders.find((o) => o.id === orderId);
+      fetch(`/api/orders/${orderId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          priceQuotes: [...(target?.priceQuotes || []).filter((q) => q.id !== quote.id), quote],
+        }),
+      }).catch((e) => console.log('Quote sync notice:', e));
+      appSync.publish('ORDERS_UPDATED', { id: orderId, priceQuotes: [quote] }, 'admin');
+      showToast(
+        `📤 Price Adjustment Quote sent to ${target?.buyerName || 'the buyer'} — ${quote.cropName} at ₱${quote.proposedBuyerPrice.toFixed(2)}/kg (was ₱${quote.currentBuyerPrice.toFixed(2)}/kg). Fulfillment waits for their approval.`
+      );
+    },
+    [orders]
+  );
+
+  // Buyer responds to a Price Adjustment Quote on a pending order. Approving
+  // re-prices that crop's order line to the quoted buyer price; declining
+  // returns the quote to the Admin (who can then cancel or mark items
+  // unavailable).
+  const handleRespondPriceQuote = useCallback(
+    (orderId: string, quoteId: string, approve: boolean) => {
+      const order = orders.find((o) => o.id === orderId);
+      if (!order) return;
+      const quote = (order.priceQuotes || []).find((q) => q.id === quoteId);
+      if (!quote) return;
+
+      const quotes: PriceAdjustmentQuote[] = (order.priceQuotes || []).map((q) =>
+        q.id === quoteId
+          ? { ...q, status: approve ? ('approved' as const) : ('declined' as const), respondedAt: new Date().toISOString() }
+          : q
+      );
+
+      let items = order.items;
+      let subtotal = Number(order.subtotal) || 0;
+      let totalAmount = Number(order.totalAmount) || 0;
+      let farmgateCostTotal = Number(order.farmgateCostTotal) || 0;
+      let adminCommissionTotal = Number(order.adminCommissionTotal) || 0;
+
+      if (approve) {
+        const cropKey = quote.cropName.trim().toLowerCase();
+        items = order.items.map((it) =>
+          (it.produceName || '').trim().toLowerCase() === cropKey && it.itemStatus !== 'unavailable'
+            ? { ...it, unitPrice: quote.proposedBuyerPrice, pricePerUnit: quote.proposedBuyerPrice }
+            : it
+        );
+        subtotal =
+          Math.round(
+            items
+              .filter((it) => it.itemStatus !== 'unavailable')
+              .reduce((s, it) => s + (Number(it.quantity) || 0) * (Number(it.unitPrice ?? it.pricePerUnit) || 0), 0) * 100
+          ) / 100;
+        farmgateCostTotal =
+          Math.round(items.reduce((s, it) => s + (Number(it.farmgateUnitPrice) || 0) * (Number(it.quantity) || 0), 0) * 100) / 100;
+        adminCommissionTotal = Math.round((subtotal - farmgateCostTotal) * 100) / 100;
+        totalAmount = Math.round((subtotal + (Number(order.deliveryFee) || 0)) * 100) / 100;
+      }
+
+      const updated: Order = {
+        ...order,
+        priceQuotes: quotes,
+        items,
+        subtotal,
+        totalAmount,
+        farmgateCostTotal,
+        adminCommissionTotal,
+      };
+      setOrders((prev) => {
+        const next = prev.map((o) => (o.id === orderId ? updated : o));
+        localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(next));
+        return next;
+      });
+      fetch(`/api/orders/${orderId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updated),
+      }).catch((e) => console.log('Quote response sync notice:', e));
+      appSync.publish('ORDERS_UPDATED', updated, 'market');
+      showToast(
+        approve
+          ? `✅ Quote approved — ${quote.cropName} will be billed at ₱${quote.proposedBuyerPrice.toFixed(2)}/kg. The Admin can now fulfil your order.`
+          : `❌ Quote declined — the Admin keeps ${quote.cropName} at ₱${quote.currentBuyerPrice.toFixed(2)}/kg and may mark it unavailable instead.`
+      );
+    },
+    [orders]
+  );
+
+  // Buyer Purchase Request modal — a generic "Request Crops" tap from the
+  // Cart menu opens with a CLEAN slate; a product-specific "Request" tap is
+  // pre-filled with that market crop (quantity capped at its shelf stock).
+  const openRequestCrops = useCallback((produce?: ProduceItem, qty?: number) => {
+    setRequestCropsPreset(produce ? { produce, qty } : null);
+    setIsRequestCropsOpen(true);
+  }, []);
+
+  // Produce detail modal / farm profile request taps broadcast this app-wide
+  // event — route them into the same request modal, pre-filled with the crop.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as (ProduceItem & { requestQty?: number }) | undefined;
+      if (detail) {
+        const { requestQty, ...produce } = detail;
+        openRequestCrops(produce as ProduceItem, requestQty);
+      }
+    };
+    window.addEventListener('veggieconnect:request-product', handler);
+    return () => window.removeEventListener('veggieconnect:request-product', handler);
+  }, [openRequestCrops]);
+
   // Cart Management
   const cartCount = useMemo(() => {
     return cart.reduce((sum, item) => sum + item.quantity, 0);
@@ -1013,21 +1463,31 @@ export default function App() {
     if (e && typeof e === 'object' && 'stopPropagation' in e) {
       e.stopPropagation();
     }
-    const qtyToAdd = typeof e === 'number' ? e : 1;
+    // Card "Add to Cart" taps stage the 20 kg per-product minimum; the
+    // product detail modal passes its explicit stepper quantity instead.
+    const qtyToAdd = typeof e === 'number' ? e : MIN_PRODUCT_KG;
+    const stock = typeof produce.stockQuantity === 'number'
+      ? produce.stockQuantity
+      : parseInt(String(produce.stockQuantity), 10) || 0;
+    const cappedQty = Math.min(qtyToAdd, Math.max(0, stock));
+    if (cappedQty <= 0) {
+      showToast(`${produce.name} is sold out right now.`);
+      return;
+    }
 
     setCart((prevCart) => {
       const existing = prevCart.find((item) => item.produce.id === produce.id);
       if (existing) {
         return prevCart.map((item) =>
           item.produce.id === produce.id
-            ? { ...item, quantity: Math.min(produce.stockQuantity, item.quantity + qtyToAdd) }
+            ? { ...item, quantity: Math.min(produce.stockQuantity, item.quantity + cappedQty) }
             : item
         );
       }
-      return [...prevCart, { produce, quantity: qtyToAdd }];
+      return [...prevCart, { produce, quantity: cappedQty }];
     });
 
-    showToast(`Added ${produce.name} to Direct Basket!`);
+    showToast(`Added ${cappedQty} kg of ${produce.name} to your cart!`);
   };
 
   const handleUpdateCartQuantity = (produceId: string, quantity: number) => {
@@ -1046,25 +1506,66 @@ export default function App() {
 
   // Order Handlers
   const handleOrderPlaced = (newOrder: Order) => {
+    // ── Warehouse-first stock target resolution ────────────────────────────
+    // Buyer purchases are fulfilled from the ADMIN's warehouse shelf — the
+    // supermarket-owned records the Stocks menu displays. Validation and the
+    // visual deduction therefore target the highest-stock WAREHOUSE record
+    // matching the crop name; the farmer's original listing is never consumed
+    // by a buyer sale (it remains the admin's future sourcing pool). When the
+    // admin holds no warehouse record for the crop at all, the item's own
+    // produce record (exact id) is the target.
+    const isWarehouseOwnedRecord = (p: ProduceItem) =>
+      p.sellerStoreName === 'VeggieConnect Supermarket' ||
+      p.sellerStatus === 'bought_and_stocked' ||
+      p.farmName === 'VeggieConnect Supermarket' ||
+      p.farmerName === 'VeggieConnect Central Produce Hub' ||
+      p.farmerId === 'admin-main' ||
+      (typeof p.id === 'string' && p.id.startsWith('sm-'));
+    const cropNamesMatch = (productName: any, requested: string) => {
+      const a = String(productName || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
+      const b = String(requested || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
+      if (!a || !b) return false;
+      return a === b || a.includes(b) || b.includes(a);
+    };
+    const stockOfProd = (p: ProduceItem) =>
+      typeof p.stockQuantity === 'number' ? p.stockQuantity : parseInt(String(p.stockQuantity), 10) || 0;
+    const resolveTarget = (it: OrderItem): ProduceItem | undefined => {
+      const requestedName = (it.produceName || '').trim();
+      const warehouseTarget = produceList
+        .filter((p) => isWarehouseOwnedRecord(p) && cropNamesMatch(p.name, requestedName))
+        .sort((a, b) => stockOfProd(b) - stockOfProd(a))[0];
+      if (warehouseTarget) return warehouseTarget;
+      const byId = produceList.find((p) => p.id === it.produceId);
+      if (byId) return byId;
+      return produceList.find(
+        (p) => (p.name || '').trim().toLowerCase() === requestedName.toLowerCase()
+      );
+    };
+
     // ── Stock Validation (client choke point) ──────────────────────────────
-    // Every ordered/requested item that matches a listed market crop must fit
-    // within its available shelf stock. Custom sourcing requests that match no
-    // listed crop pass through — the Admin sources them from farmers.
+    // Direct basket items must fit within their resolved target shelf stock.
+    // REQUEST lots ("req-prod-*", Cart ▸ Request Crops) may exceed a single
+    // shelf record — the Admin fulfils them with the multi-farmer split
+    // allocation (warehouse first, then farmer harvests cheapest-first), so
+    // their ceiling is the TOTAL availability for that crop.
     const stockProblems: string[] = [];
     for (const it of newOrder.items) {
-      const q = (it.produceName || '').trim().toLowerCase();
-      const prod =
-        produceList.find((p) => p.id === it.produceId) ||
-        produceList.find((p) => (p.name || '').trim().toLowerCase() === q) ||
-        (q.length > 0
-          ? produceList.find(
-              (p) =>
-                ((p.name || '').toLowerCase().includes(q) || q.includes((p.name || '').toLowerCase())) &&
-                (p.name || '').length > 0
-            )
-          : undefined);
+      const isRequestLot = !it.produceId || String(it.produceId).startsWith('req-prod-');
+      if (isRequestLot) {
+        const requestedName = String(it.produceName || '').trim();
+        const totalAvailability = produceList
+          .filter((p) => (stockOfProd(p) || 0) > 0 && cropNamesMatch(p.name, requestedName))
+          .reduce((s, p) => s + stockOfProd(p), 0);
+        if ((it.quantity || 0) > totalAvailability) {
+          stockProblems.push(
+            `${it.produceName}: requested ${it.quantity}${it.unit || 'kg'}, only ${totalAvailability}${it.unit || 'kg'} available across the market and farmer listings`
+          );
+        }
+        continue;
+      }
+      const prod = resolveTarget(it);
       if (!prod) continue;
-      const stock = typeof prod.stockQuantity === 'number' ? prod.stockQuantity : parseInt(String(prod.stockQuantity), 10) || 0;
+      const stock = stockOfProd(prod);
       if ((it.quantity || 0) > stock) {
         stockProblems.push(`${it.produceName}: requested ${it.quantity}${it.unit || 'kg'}, only ${stock}${prod.unit || 'kg'} on the shelf`);
       }
@@ -1072,6 +1573,28 @@ export default function App() {
     if (stockProblems.length > 0) {
       showToast(`⚠️ Request blocked — ${stockProblems.join(' • ')}`);
       return;
+    }
+
+    // Deduction plan: exactly ONE produce record per DIRECT ordered item
+    // (running stock so repeated crops in one order never over-deduct).
+    // REQUEST lots deduct ONLY at fulfillment (multi-farmer allocation),
+    // never at request time.
+    const deductionPlan = new Map<string, { newStock: number; originalStock: number }>();
+    {
+      const running = new Map<string, number>(produceList.map((p) => [p.id, stockOfProd(p)]));
+      for (const it of newOrder.items) {
+        if (!it.produceId || String(it.produceId).startsWith('req-prod-')) continue;
+        const target = resolveTarget(it);
+        if (!target) continue;
+        const prevStock = running.get(target.id) ?? stockOfProd(target);
+        const nextStock = Math.max(0, prevStock - (it.quantity || 0));
+        running.set(target.id, nextStock);
+        if (!deductionPlan.has(target.id)) {
+          deductionPlan.set(target.id, { newStock: nextStock, originalStock: prevStock });
+        } else {
+          deductionPlan.get(target.id)!.newStock = nextStock;
+        }
+      }
     }
 
     const generatedJobId = `TJ-${Date.now().toString().slice(-4)}`;
@@ -1083,25 +1606,29 @@ export default function App() {
     setOrders((prev) => [orderPayload, ...prev]);
 
     // Deduct purchased crop stock locally (visual only) — the server
-    // POST /api/orders performs the authoritative deduction, so the client
-    // no longer needs to PUT the deducted stock back (that used to
-    // double-deduct for cart orders).
-    setProduceList((prev) => {
-      const updated = prev.map((prod) => {
-        const matchingItem = newOrder.items.find((it) => it.produceId === prod.id);
-        if (matchingItem) {
-          const newStock = Math.max(0, prod.stockQuantity - matchingItem.quantity);
-          return {
-            ...prod,
-            stockQuantity: newStock,
-            sellerStatus: newStock === 0 && !prod.sellerStoreName ? ('sold_out' as const) : prod.sellerStatus,
-          };
-        }
-        return prod;
+    // POST /api/orders performs the authoritative deduction with the same
+    // warehouse-first resolution, so the client no longer needs to PUT the
+    // deducted stock back (that used to double-deduct for cart orders).
+    if (deductionPlan.size > 0) {
+      setProduceList((prev) => {
+        const updated = prev.map((prod) => {
+          const plan = deductionPlan.get(prod.id);
+          if (plan) {
+            return {
+              ...prod,
+              stockQuantity: plan.newStock,
+              sellerStatus:
+                plan.newStock === 0 && !prod.sellerStoreName
+                  ? ('sold_out' as const)
+                  : prod.sellerStatus,
+            };
+          }
+          return prod;
+        });
+        localStorage.setItem(STORAGE_KEYS.PRODUCE, JSON.stringify(updated));
+        return updated;
       });
-      localStorage.setItem(STORAGE_KEYS.PRODUCE, JSON.stringify(updated));
-      return updated;
-    });
+    }
 
     // Send to backend API — the server re-validates stock against the
     // latest shelf state so two buyers requesting the same remaining stock
@@ -1120,9 +1647,9 @@ export default function App() {
           setOrders((prev) => prev.filter((o) => o.id !== orderPayload.id));
           setProduceList((prev) => {
             const restored = prev.map((prod) => {
-              const matchingItem = newOrder.items.find((it) => it.produceId === prod.id);
-              if (matchingItem) {
-                const restoredStock = prod.stockQuantity + matchingItem.quantity;
+              const plan = deductionPlan.get(prod.id);
+              if (plan) {
+                const restoredStock = plan.originalStock;
                 return {
                   ...prod,
                   stockQuantity: restoredStock,
@@ -1354,6 +1881,34 @@ export default function App() {
         }),
       }).catch((e) => console.log('Order cancel sync notice:', e));
 
+      // ── Wallet refund on cancellation ────────────────────────────────────
+      // A PAID order that gets cancelled (admin decline or buyer request)
+      // returns the buyer's remaining money to their VeggieConnect Pay
+      // wallet: what they paid minus refunds already credited for
+      // unavailable products. Unpaid orders were never charged, so nothing
+      // is returned for them.
+      const paidAmount = Number(targetOrder?.paidAmount) || 0;
+      const alreadyCredited = Number(targetOrder?.refundedCredited) || 0;
+      const refundDue = Math.round((paidAmount - alreadyCredited) * 100) / 100;
+      if (targetOrder?.paymentStatus === 'paid' && refundDue > 0) {
+        const refundedBuyerId = targetOrder.buyerId;
+        if (refundedBuyerId) {
+          void postWalletTransaction(
+            refundedBuyerId,
+            'refund',
+            refundDue,
+            `Refund — Order ${targetOrder.id} cancelled`,
+            targetOrder.id
+          ).then((updated) => {
+            if (updated) {
+              showToast(
+                `↩️ ₱${refundDue.toLocaleString()} refunded to ${targetOrder?.buyerName}'s wallet (order cancelled).`
+              );
+            }
+          });
+        }
+      }
+
       appSync.publish('ORDERS_UPDATED', { id: orderId, status: 'cancelled' }, 'admin');
       appSync.publish('JOBS_UPDATED', { orderId, status: 'cancelled' }, 'admin');
       appSync.publish('PRODUCE_UPDATED', { restocked: true }, 'admin');
@@ -1361,20 +1916,16 @@ export default function App() {
       return;
     }
 
-    // ── Request-lot warehouse deduction (visual mirror, exactly once) ───────
-    // When an order FIRST leaves 'pending' into ANY active fulfillment status
-    // (confirmed / ready_for_pickup_delivery / picked_up / in_transit /
-    // completed), deduct its request-lot items (placeholder "req-prod-*" ids)
-    // from the WAREHOUSE records the admin's Stocks menu displays.
-    //
-    // WHY: orders can be completed from several desks ("Fulfill Buyer
-    // Request", "Mark Delivered", receipt "Mark Order as Completed", haul
-    // delivery) — previously only the Fulfill desk deducted, so completing an
-    // order anywhere else left the sold quantity stuck on the Stocks menu.
-    // The backend performs the authoritative deduction for the same
-    // transition; this mirror keeps the admin's view in sync instantly. The
-    // order's requestStockDeducted flag guarantees exactly one deduction even
-    // if the order advances through several statuses.
+    // ── Request-lot deduction is SERVER-authoritative (multi-farmer split
+    // allocation) ────────────────────────────────────────────────────────────
+    // When an order FIRST leaves 'pending' into ANY active fulfillment status,
+    // the BACKEND runs the sourcing plan: warehouse shelf first, then farmer
+    // harvest lots sorted by farmgate price ASC, allocated and deducted
+    // sequentially until the requested quantity is met — recording the
+    // sourcing allocations, weighted average cost and net admin profit on the
+    // order. The client no longer mirrors the deduction visually (a partial
+    // warehouse-only mirror would disagree with the split allocation); the
+    // 2.5s products/orders poll brings the Stocks menu and ledger in sync.
     const FULFILLMENT_STATUSES = [
       'confirmed',
       'ready_for_pickup_delivery',
@@ -1383,62 +1934,10 @@ export default function App() {
       'completed',
     ];
     const isRequestLotItem = (pid: any) => !pid || String(pid).startsWith('req-prod-');
-    const cropNamesMatch = (productName: any, requested: string) => {
-      const a = String(productName || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
-      const b = String(requested || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
-      if (!a || !b) return false;
-      return a === b || a.includes(b) || b.includes(a);
-    };
-    const isWarehouseOwnedRecord = (p: ProduceItem) =>
-      p.sellerStoreName === 'VeggieConnect Supermarket' ||
-      p.sellerStatus === 'bought_and_stocked' ||
-      p.farmName === 'VeggieConnect Supermarket' ||
-      p.farmerName === 'VeggieConnect Central Produce Hub' ||
-      p.farmerId === 'admin-main' ||
-      (typeof p.id === 'string' && p.id.startsWith('sm-'));
 
     const orderHadRequestLots = Boolean(
       targetOrder && (targetOrder.items || []).some((it) => isRequestLotItem(it.produceId))
     );
-    const shouldDeductRequestLots =
-      orderHadRequestLots &&
-      targetOrder &&
-      previousStatus !== 'cancelled' &&
-      !targetOrder.requestStockDeducted &&
-      (previousStatus === 'pending' || previousStatus === undefined) &&
-      FULFILLMENT_STATUSES.includes(newStatus);
-
-    if (shouldDeductRequestLots && targetOrder) {
-      const nextList = [...produceList];
-      let deductedLots = 0;
-      for (const item of targetOrder.items || []) {
-        if (!isRequestLotItem(item.produceId)) continue; // direct basket lot — deducted at checkout
-        const requestedName = String(item.produceName || '').trim();
-        const needed = Number(item.quantity) || 0;
-        if (!requestedName || needed <= 0) continue;
-        // Warehouse-first target: highest-stock owned record matching the crop,
-        // then any exact-name record — same matching rules as the backend.
-        const target =
-          nextList
-            .filter((p) => isWarehouseOwnedRecord(p) && cropNamesMatch(p.name, requestedName))
-            .sort((a, b) => (Number(b.stockQuantity) || 0) - (Number(a.stockQuantity) || 0))[0] ||
-          nextList.find((p) => (p.name || '').trim().toLowerCase() === requestedName.toLowerCase());
-        if (!target) continue;
-        const idx = nextList.findIndex((p) => p.id === target.id);
-        if (idx < 0) continue;
-        const newQty = Math.max(0, (Number(target.stockQuantity) || 0) - needed);
-        nextList[idx] = { ...target, stockQuantity: newQty };
-        deductedLots += 1;
-      }
-      if (deductedLots > 0) {
-        setProduceList(nextList);
-        localStorage.setItem(STORAGE_KEYS.PRODUCE, JSON.stringify(nextList));
-        appSync.publish('PRODUCE_UPDATED', { requestLotsDeducted: true, orderId }, 'admin');
-        showToast(
-          `✅ Order #${orderId} — ${deductedLots} requested lot(s) deducted from warehouse stock`
-        );
-      }
-    }
 
     // Regular non-cancellation status update
     setOrders((prev) => {
@@ -1475,11 +1974,30 @@ export default function App() {
     // Sync to backend — send the FULL order (not just the status) so a
     // backend that lost the row (restart) recreates it WITH its items;
     // the server-side request-lot warehouse deduction needs those items.
+    // A 409 means LOSS PREVENTION blocked fulfillment (a farmer asks above
+    // the fixed buyer price): the server deducted nothing and kept the order
+    // pending — revert this client's optimistic status change and resync.
     fetch(`/api/orders/${orderId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(targetOrder ? { ...targetOrder, status: newStatus } : { status: newStatus }),
-    }).catch((e) => console.log('Order status sync notice:', e));
+    })
+      .then(async (res) => {
+        if (res.status === 409) {
+          const data = await res.json().catch(() => null);
+          setOrders((prev) => {
+            const next = prev.map((o) =>
+              o.id === orderId
+                ? { ...o, status: previousStatus || 'pending', requestStockDeducted: false }
+                : o
+            );
+            localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(next));
+            return next;
+          });
+          showToast(`🛑 ${data?.error || 'Fulfillment blocked — send the buyer a Price Adjustment Quote.'}`);
+        }
+      })
+      .catch((e) => console.log('Order status sync notice:', e));
 
     appSync.publish('ORDERS_UPDATED', { id: orderId, status: newStatus }, 'admin');
     showToast(`Order status updated to "${newStatus.replace('_', ' ')}"`);
@@ -1510,14 +2028,16 @@ export default function App() {
 
     // Find the corresponding order by orderId or by farm + buyer fallback
     const targetJob = transportJobs.find((j) => j.id === jobId);
+    const normPickupFarm = String(targetJob?.pickupFarm || '').trim().toLowerCase();
+    const normBuyerName = String(targetJob?.buyerName || '').trim().toLowerCase();
     const targetOrderId =
       targetJob?.orderId ||
       orders.find(
         (o) =>
           o.deliveryType === 'direct_delivery' &&
           o.status !== 'completed' &&
-          ((targetJob?.pickupFarm && o.farmName.trim().toLowerCase() === targetJob.pickupFarm.trim().toLowerCase()) ||
-           (targetJob?.buyerName && o.buyerName.trim().toLowerCase() === targetJob.buyerName.trim().toLowerCase()))
+          ((normPickupFarm && String(o.farmName || '').trim().toLowerCase() === normPickupFarm) ||
+           (normBuyerName && String(o.buyerName || '').trim().toLowerCase() === normBuyerName))
       )?.id;
 
     // Immediately update order status to in_transit and record who is delivering (the admin)
@@ -1527,8 +2047,8 @@ export default function App() {
           (targetOrderId && o.id === targetOrderId) ||
           (targetJob?.orderId && o.id === targetJob.orderId) ||
           (targetJob &&
-            o.farmName.trim().toLowerCase() === targetJob.pickupFarm.trim().toLowerCase() &&
-            o.buyerName.trim().toLowerCase() === targetJob.buyerName.trim().toLowerCase() &&
+            String(o.farmName || '').trim().toLowerCase() === normPickupFarm &&
+            String(o.buyerName || '').trim().toLowerCase() === normBuyerName &&
             o.status !== 'completed');
 
         if (isMatch) {
@@ -1584,13 +2104,15 @@ export default function App() {
 
     // Find matched order
     const targetJob = transportJobs.find((j) => j.id === jobId);
+    const normPickupFarm = String(targetJob?.pickupFarm || '').trim().toLowerCase();
+    const normBuyerName = String(targetJob?.buyerName || '').trim().toLowerCase();
     const targetOrderId =
       targetJob?.orderId ||
       orders.find(
         (o) =>
           o.deliveryType === 'direct_delivery' &&
-          ((targetJob?.pickupFarm && o.farmName.trim().toLowerCase() === targetJob.pickupFarm.trim().toLowerCase()) ||
-           (targetJob?.buyerName && o.buyerName.trim().toLowerCase() === targetJob.buyerName.trim().toLowerCase()))
+          ((normPickupFarm && String(o.farmName || '').trim().toLowerCase() === normPickupFarm) ||
+           (normBuyerName && String(o.buyerName || '').trim().toLowerCase() === normBuyerName))
       )?.id;
 
     const newOrderStatus: Order['status'] =
@@ -1608,8 +2130,8 @@ export default function App() {
           (targetOrderId && o.id === targetOrderId) ||
           (targetJob?.orderId && o.id === targetJob.orderId) ||
           (targetJob &&
-            o.farmName.trim().toLowerCase() === targetJob.pickupFarm.trim().toLowerCase() &&
-            o.buyerName.trim().toLowerCase() === targetJob.buyerName.trim().toLowerCase());
+            String(o.farmName || '').trim().toLowerCase() === normPickupFarm &&
+            String(o.buyerName || '').trim().toLowerCase() === normBuyerName);
 
         return isMatch ? { ...o, status: newOrderStatus } : o;
       })
@@ -1635,8 +2157,16 @@ export default function App() {
     }
   };
 
-  // Farmer Add Produce
+  // Farmer Add Produce — gated by the DA verification workflow: a PENDING
+  // farmer cannot submit harvests for sale until the Admin approves their
+  // registration (Valid Government ID review).
   const handleAddProduce = (newProduceData: Omit<ProduceItem, 'id' | 'rating' | 'reviewsCount'>) => {
+    if (currentUser && userRole === 'farmer' && isVerificationPending(currentUser)) {
+      showToast('Your account is pending DA Admin approval — harvest listings unlock after your Valid Government ID is verified.');
+      setIsAddProduceOpen(false);
+      setEditingProduce(null);
+      return;
+    }
     const coords = resolveCoordinates(newProduceData.location, newProduceData.latitude, newProduceData.longitude);
     const newItem: ProduceItem = {
       ...newProduceData,
@@ -2864,6 +3394,8 @@ export default function App() {
             onBuyFarmerProduct={handleBuyFarmerProduct}
             onPutInSupermarketStock={handlePutInSupermarketStock}
             onUpdateOrderStatus={handleUpdateOrderStatus}
+            onMarkItemUnavailable={handleMarkItemUnavailable}
+            onSendPriceQuote={handleSendPriceQuote}
             onUpdateTransportJobStatus={handleUpdateTransportJobStatus}
             onAcceptTransportJob={handleAcceptTransportJob}
             onAdminLogin={(admin) => {
@@ -2975,6 +3507,41 @@ export default function App() {
           onLogout={handleLogout}
         />
 
+        {/* PENDING ADMIN APPROVAL banner — shown on every screen while the
+            account is still in the DA Admin verification queue. Pending
+            Farmers cannot submit harvests; Pending Buyers cannot place orders. */}
+        {currentUser && isVerificationPending(currentUser) && (
+          <div
+            className="mx-3 mt-2 rounded-2xl border border-amber-300 bg-amber-50 px-3.5 py-2.5 text-amber-900 flex items-start gap-2 shadow-sm"
+            id="banner-pending-approval"
+          >
+            <AlertCircle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <p className="text-[11px] font-black">Pending Admin Approval</p>
+              <p className="text-[10px] leading-relaxed mt-0.5">
+                Your Valid Government ID is under DA review.{' '}
+                {userRole === 'farmer'
+                  ? 'You can browse the app, but submitting harvests for sale unlocks once the DA Admin approves your registration.'
+                  : 'You can browse the market and prepare your cart, but placing vegetable orders unlocks once the DA Admin approves your registration.'}
+              </p>
+            </div>
+          </div>
+        )}
+        {currentUser && isVerificationRejected(currentUser) && (
+          <div
+            className="mx-3 mt-2 rounded-2xl border border-rose-300 bg-rose-50 px-3.5 py-2.5 text-rose-900 flex items-start gap-2 shadow-sm"
+            id="banner-rejected"
+          >
+            <AlertCircle className="w-4 h-4 text-rose-500 flex-shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <p className="text-[11px] font-black">Registration Rejected</p>
+              <p className="text-[10px] leading-relaxed mt-0.5">
+                The DA Admin could not verify your documents. Selling and ordering stay disabled — contact support or re-register with clearer ID photos.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Views based on active tab for community roles */}
           {activeTab === 'market' && (
             <ErrorBoundary fallbackTitle="Unable to load Market view">
@@ -2984,8 +3551,6 @@ export default function App() {
                 onAddToCart={handleAddToCart}
                 cartItemIds={cartItemIds}
                 isBuyer={userRole === 'buyer'}
-                currentUser={currentUser}
-                onOrderPlaced={handleOrderPlaced}
               />
             </ErrorBoundary>
           )}
@@ -3009,11 +3574,13 @@ export default function App() {
             <CartDrawer
               cart={cart}
               currentUser={currentUser}
+              verificationPending={Boolean(currentUser && userRole === 'buyer' && isVerificationPending(currentUser))}
               onUpdateQuantity={handleUpdateCartQuantity}
               onRemoveItem={handleRemoveFromCart}
               onClearCart={handleClearCart}
               onOrderPlaced={handleOrderPlaced}
               onClose={() => handleSelectTab('market')}
+              onRequestCrops={() => openRequestCrops()}
             />
           )}
 
@@ -3026,6 +3593,17 @@ export default function App() {
               initialFilter={ordersInitialFilter}
               onUpdateOrderStatus={handleUpdateOrderStatus}
               onChatWithParty={handleChatFromOrder}
+              onPayOrder={handlePayOrder}
+              onRespondPriceQuote={handleRespondPriceQuote}
+              onNavigateToWallet={() => handleSelectTab('wallet')}
+            />
+          )}
+
+          {activeTab === 'wallet' && currentUser && (
+            <WalletView
+              currentUser={currentUser}
+              onDeposit={handleWalletDeposit}
+              onNavigateTab={(tab) => handleSelectTab(tab)}
             />
           )}
 
@@ -3036,6 +3614,7 @@ export default function App() {
               orders={orders}
               currentUser={currentUser}
               registeredUsers={registeredUsers}
+              verificationPending={Boolean(currentUser && userRole === 'farmer' && isVerificationPending(currentUser))}
               onOpenAddProduce={() => {
                 setEditingProduce(null);
                 setIsAddProduceOpen(true);
@@ -3191,6 +3770,19 @@ export default function App() {
           initialSearch={globalPriceWatchSearch}
         />
       )}
+
+      {/* Buyer Vegetable Purchase Request modal — lives at app level so it can
+          be opened from the CART menu's "Request Crops" button AND from any
+          product-specific "Request" tap (market card, detail modal, farm page). */}
+      <RequestCropsModal
+        isOpen={isRequestCropsOpen}
+        presetProduct={requestCropsPreset?.produce || null}
+        preferredQty={requestCropsPreset?.qty}
+        produceList={supermarketProduceList}
+        currentUser={currentUser}
+        onClose={() => setIsRequestCropsOpen(false)}
+        onOrderPlaced={handleOrderPlaced}
+      />
 
       </MobileFrame>
     </div>
