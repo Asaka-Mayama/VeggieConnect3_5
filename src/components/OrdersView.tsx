@@ -15,7 +15,6 @@ import {
   MapPin,
   XCircle,
   AlertTriangle,
-  RotateCcw,
   CalendarDays,
   TrendingUp,
   Wallet,
@@ -170,9 +169,12 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
     return counts;
   }, [farmerDateBuckets]);
 
-  // Total-sales summary for the selected date (or All Dates). Cancelled
-  // transactions are excluded from sales, matching the Farmer dashboard's
-  // "Total Sales" basis (order total). Delivered vs in-progress split shown.
+  // Total-sales summary for the selected date (or All Dates). ONLY completed
+  // transactions count as sales — the admin must have actually bought the
+  // product and the transaction must be finished before a peso amount becomes
+  // a sale (matching the Farmer dashboard's "Total Sales"). Cancelled and
+  // still-in-progress transactions are excluded from the headline figure; the
+  // in-progress peso value stays visible as an informational line.
   const farmerSummary = useMemo(() => {
     if (!farmerDateBuckets) return null;
     const inScope =
@@ -181,12 +183,13 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         : roleFilteredOrders.filter((o) => getOrderDateKey(o.createdAt) === selectedDateKey);
     return {
       label: selectedDateKey === 'all' ? 'All Dates' : formatDateKeyLabel(selectedDateKey),
-      total: salesSum(inScope),
+      total: salesSum(inScope.filter((o) => o.status === 'completed')),
       delivered: salesSum(inScope.filter((o) => o.status === 'completed')),
       inProgress: salesSum(
         inScope.filter((o) => o.status !== 'completed' && o.status !== 'cancelled')
       ),
       txCount: inScope.length,
+      completedCount: inScope.filter((o) => o.status === 'completed').length,
       cancelledCount: inScope.filter((o) => o.status === 'cancelled').length,
     };
   }, [farmerDateBuckets, roleFilteredOrders, selectedDateKey]);
@@ -269,7 +272,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         return (
           <span className="bg-red-100 text-red-900 border border-red-300 text-[10px] font-bold px-2.5 py-0.5 rounded-full flex items-center gap-1">
             <XCircle className="w-3 h-3 text-red-600" />
-            <span>Cancelled &amp; Restocked</span>
+            <span>Cancelled</span>
           </span>
         );
     }
@@ -390,7 +393,9 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                 </span>
               </div>
               <p className="text-[10px] text-emerald-200/90 mt-1">
-                Delivered ₱{farmerSummary.delivered.toFixed(2)} · In Progress ₱{farmerSummary.inProgress.toFixed(2)}
+                {farmerSummary.completedCount} completed sale
+                {farmerSummary.completedCount === 1 ? '' : 's'} counted · In Progress ₱
+                {farmerSummary.inProgress.toFixed(2)} not yet sales (admin has not completed the buy)
                 {farmerSummary.cancelledCount > 0
                   ? ` · ${farmerSummary.cancelledCount} cancelled not counted`
                   : ''}
@@ -577,10 +582,6 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         <XCircle className="w-4 h-4 text-red-600 flex-shrink-0" />
                         <span>Order Cancelled {order.cancelledAt ? `(${order.cancelledAt})` : ''}</span>
                       </span>
-                      <span className="text-[10px] bg-emerald-100 text-emerald-800 font-extrabold px-2 py-0.5 rounded-md flex items-center gap-1 border border-emerald-300">
-                        <CheckCircle2 className="w-3 h-3 text-emerald-600 flex-shrink-0" />
-                        <span>+{order.items.reduce((s, it) => s + (it.quantity || 0), 0)} kg Restocked to Stock</span>
-                      </span>
                     </div>
                     {order.cancelReason && (
                       <p className="text-[11px] text-red-900 leading-snug">
@@ -640,6 +641,14 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                         {item.itemStatus === 'unavailable' && (
                           <span className="text-[9px] font-black uppercase bg-red-100 text-red-700 border border-red-200 rounded-full px-1.5 py-0.5 flex-shrink-0">
                             Unavailable{item.refundedAmount ? ` • ₱${Number(item.refundedAmount).toFixed(2)}` : ''}
+                          </span>
+                        )}
+                        {/* Partial fulfillment (v4.11): the admin fulfilled this
+                            line with less stock than requested — show what was
+                            delivered and what was returned to the buyer. */}
+                        {(item.shortfallKg || 0) > 0 && item.itemStatus !== 'unavailable' && (
+                          <span className="text-[9px] font-black uppercase bg-amber-100 text-amber-700 border border-amber-200 rounded-full px-1.5 py-0.5 flex-shrink-0">
+                            {item.quantity} of {item.originalQuantity ?? (Number(item.quantity) || 0) + (Number(item.shortfallKg) || 0)} kg fulfilled{item.refundedAmount ? ` • ₱${Number(item.refundedAmount).toFixed(2)} returned` : ''}
                           </span>
                         )}
                       </div>
@@ -1023,7 +1032,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                           setCancelReasonInput('');
                         }}
                         className="flex-1 min-w-[105px] h-10 px-2 sm:px-3 rounded-xl bg-red-50 hover:bg-red-100 text-red-700 hover:text-red-800 text-xs font-bold flex items-center justify-center gap-1.5 border border-red-200 cursor-pointer transition-all active:scale-95 shadow-2xs"
-                        title="Cancel order and restock items to inventory"
+                        title="Cancel this order"
                       >
                         <XCircle className="w-3.5 h-3.5 text-red-600 flex-shrink-0" />
                         <span className="truncate">Cancel Order</span>
@@ -1095,12 +1104,27 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                 <div key={i} className="flex justify-between text-neutral-700">
                   <span>
                     {item.produceName} ({item.quantity} {item.unit})
+                    {(item.shortfallKg || 0) > 0 && (
+                      <span className="text-amber-700 font-bold"> — {item.shortfallKg} {item.unit} unavailable</span>
+                    )}
                   </span>
                   <span className="font-bold text-emerald-950">
                     ₱{(Number((item.unitPrice || item.pricePerUnit || 0) * (item.quantity || 1)) || 0).toFixed(2)}
                   </span>
                 </div>
               ))}
+              {(Number(selectedReceiptOrder.refundedTotal) || 0) > 0 && (
+                <div className="flex justify-between text-red-600 font-bold">
+                  <span>Unavailable / shortfall returned:</span>
+                  <span>−₱{Number(selectedReceiptOrder.refundedTotal).toFixed(2)}</span>
+                </div>
+              )}
+              {(Number(selectedReceiptOrder.bulkDiscount) || 0) > 0 && (
+                <div className="flex justify-between text-emerald-700 font-bold">
+                  <span>Bulk Discount (90 kg+):</span>
+                  <span>−₱{Number(selectedReceiptOrder.bulkDiscount).toFixed(2)}</span>
+                </div>
+              )}
               <div className="border-t border-emerald-100 pt-2 flex justify-between font-extrabold text-sm text-emerald-950">
                 <span>Total Paid Directly:</span>
                 <span className="text-emerald-700">₱{(Number(selectedReceiptOrder.totalAmount ?? selectedReceiptOrder.subtotal) || 0).toFixed(2)}</span>
@@ -1124,7 +1148,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
         </div>
       )}
 
-      {/* Order Cancellation & Restock Confirmation Modal */}
+      {/* Order Cancellation Confirmation Modal */}
       {orderToCancel && (
         <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs animate-in fade-in duration-200">
           <div className="bg-white border border-red-200 rounded-3xl w-full max-w-sm max-h-[92%] overflow-y-auto p-5 space-y-4 text-neutral-900 shadow-2xl relative">
@@ -1143,32 +1167,14 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                 <AlertTriangle className="w-5 h-5 text-red-600" />
               </div>
               <div className="min-w-0">
-                <h3 className="font-extrabold text-sm text-neutral-900 truncate">Cancel Order & Restock</h3>
+                <h3 className="font-extrabold text-sm text-neutral-900 truncate">Cancel Order</h3>
                 <p className="text-[11px] text-neutral-500 font-mono">Order ID: {orderToCancel.id}</p>
               </div>
             </div>
 
-            {/* Inventory Restock Breakdown Box */}
-            <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-3 space-y-2 text-xs">
-              <div className="flex items-center gap-1.5 font-bold text-emerald-950">
-                <RotateCcw className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Automatic Inventory Restock</span>
-              </div>
-              <p className="text-[11px] text-emerald-800 leading-relaxed">
-                Cancelling this order immediately returns all reserved kilograms back to the supermarket live inventory:
-              </p>
-              <div className="space-y-1 pt-1 border-t border-emerald-200/80">
-                {orderToCancel.items.map((item, idx) => (
-                  <div key={idx} className="flex items-center justify-between text-[11px] text-emerald-950">
-                    <span className="font-medium truncate mr-2">• {item.produceName}</span>
-                    <span className="font-bold text-emerald-700 shrink-0">+{item.quantity} kg</span>
-                  </div>
-                ))}
-              </div>
-              <div className="pt-1.5 text-right text-[11px] font-black text-emerald-950 border-t border-emerald-200/60">
-                Total Restocked: +{orderToCancel.items.reduce((s, it) => s + (it.quantity || 0), 0)} kg
-              </div>
-            </div>
+            <p className="text-[11px] text-neutral-600 leading-relaxed">
+              Your request will be withdrawn and the Admin will be notified. No payment has been taken — orders are paid over-the-counter at the depot.
+            </p>
 
             {/* Direct Cancellation Reason Input (No multiple choice / radio buttons) */}
             <div className="space-y-1.5 text-xs">
@@ -1200,7 +1206,7 @@ export const OrdersView: React.FC<OrdersViewProps> = ({
                 className="w-full py-2.5 px-4 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-sm active:scale-95 transition-all"
               >
                 <XCircle className="w-4 h-4" />
-                <span>Confirm Cancellation & Restock Stock</span>
+                <span>Confirm Cancellation</span>
               </button>
 
               <button

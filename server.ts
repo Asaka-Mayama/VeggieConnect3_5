@@ -7,6 +7,7 @@ import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import mysql from 'mysql2/promise';
 import { buildSourcingPlan, round2 as roundMoney } from './src/utils/sourcing';
+import { findMatchingDAPrice } from './src/data/daPricesData';
 import type { SourcingAllocation } from './src/types';
 
 const app = express();
@@ -28,6 +29,17 @@ const DEMO_RESET_ENABLED = process.env.VITE_ENABLE_DEMO_RESET === 'true';
 // transporter accounts that are still stored are ignored and cannot log in.
 const VALID_ROLES = ['buyer', 'farmer', 'admin'];
 const isRetiredAccount = (u: any) => !!u && u.role === 'transporter';
+
+// Auto-capitalize names: "juan dela cruz" → "Juan Dela Cruz". Every word whose
+// first letter was typed lowercase gets capitalized in the stored details.
+function titleCaseName(value: string): string {
+  return String(value || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+    .join(' ');
+}
 
 function passwordsMatch(supplied: string, expected: string): boolean {
   const a = Buffer.from(String(supplied));
@@ -76,6 +88,17 @@ const dbConfig = {
   database: process.env.MYSQL_DATABASE || 'veggie_connect3',
   connectTimeout: 5000,
 };
+
+// Server build marker — the login screen and the Admin Console compare this
+// against their own client build (src/utils/buildInfo.ts). A stale server
+// process (old code still running after a new extraction) is then IMPOSSIBLE
+// to miss: both UIs show a red version-mismatch banner.
+const SERVER_BUILD = 'v4.12';
+
+// Order-level bulk discount: an order of 90 kg or more (any mix of products)
+// gets ₱100 off what the buyer pays. Must match src/utils/bulkDiscount.ts.
+const BULK_DISCOUNT_MIN_KG = 90;
+const BULK_DISCOUNT_PESOS = 100;
 
 let mysqlPool: mysql.Pool | null = null;
 let isMysqlConnected = false;
@@ -130,8 +153,7 @@ async function tryConnectMysql() {
           email VARCHAR(120) UNIQUE NOT NULL,
           password_hash VARCHAR(255) NOT NULL,
           phone VARCHAR(50) NOT NULL,
-          role ENUM('farmer', 'buyer', 'admin') NOT NULL,
-          location VARCHAR(200) NOT NULL,
+          role ENUM('farmer', 'buyer', 'admin') NOT NULL,          location VARCHAR(200) NOT NULL,
           farm_name VARCHAR(150),
           avatar_url VARCHAR(255),
           status ENUM('active', 'pending', 'suspended') NOT NULL DEFAULT 'active',
@@ -146,6 +168,19 @@ async function tryConnectMysql() {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB;
       `);
+
+      // Older installs created users.role as ENUM('farmer','buyer','admin');
+      // the sample-data transporters use role 'transporter' and their MySQL
+      // insert used to fail with "Data truncated for column 'role'", so the
+      // transporters vanished from the directory after every server restart.
+      // Widen the ENUM idempotently on every boot.
+      try {
+        await mysqlPool.query(
+          `ALTER TABLE users MODIFY COLUMN role ENUM('farmer','buyer','admin','transporter') NOT NULL`
+        );
+      } catch (roleAlterErr: any) {
+        console.error('MySQL role ENUM widen error:', roleAlterErr?.message || roleAlterErr);
+      }
 
       // Safely ensure status and is_verified columns exist if table was previously created
       try {
@@ -186,6 +221,23 @@ async function tryConnectMysql() {
       } catch (e) {}
       try {
         await mysqlPool.query(`ALTER TABLE users ADD COLUMN business_proof_image LONGTEXT NULL`);
+      } catch (e) {}
+      try {
+        await mysqlPool.query(`ALTER TABLE users ADD COLUMN approved_at VARCHAR(40) NULL`);
+      } catch (e) {}
+      try {
+        await mysqlPool.query(`ALTER TABLE users ADD COLUMN approved_by VARCHAR(120) NULL`);
+      } catch (e) {}
+      try {
+        await mysqlPool.query(`ALTER TABLE users ADD COLUMN rejected_at VARCHAR(40) NULL`);
+      } catch (e) {}
+      try {
+        await mysqlPool.query(`ALTER TABLE users ADD COLUMN rejected_by VARCHAR(120) NULL`);
+      } catch (e) {}
+      try {
+        // Sample-data avatars are small inline SVG data URLs (~1 KB) — widen the
+        // legacy VARCHAR(150) column so they persist in MySQL too.
+        await mysqlPool.query(`ALTER TABLE users MODIFY COLUMN avatar_url TEXT NULL`);
       } catch (e) {}
       try {
         await mysqlPool.query(`ALTER TABLE users ADD COLUMN submitted_at VARCHAR(100) NULL`);
@@ -308,6 +360,19 @@ async function tryConnectMysql() {
       ) ENGINE=InnoDB;
     `);
 
+    await mysqlPool.query(`
+      CREATE TABLE IF NOT EXISTS password_reset_requests (
+        id VARCHAR(64) PRIMARY KEY,
+        user_id VARCHAR(64) NOT NULL,
+        user_name VARCHAR(120) NOT NULL,
+        user_role VARCHAR(20) NOT NULL,
+        contact VARCHAR(200) NOT NULL,
+        status ENUM('pending', 'resolved') NOT NULL DEFAULT 'pending',
+        requested_at VARCHAR(40) NOT NULL,
+        resolved_at VARCHAR(40) NULL
+      ) ENGINE=InnoDB;
+    `);
+
       // Safely ensure status ENUM supports 'cancelled'
       try {
         await mysqlPool.query(`ALTER TABLE transport_jobs MODIFY COLUMN status ENUM('available', 'accepted', 'picked_up', 'in_transit', 'delivered', 'cancelled') NOT NULL DEFAULT 'available'`);
@@ -381,6 +446,14 @@ async function tryConnectMysql() {
     console.log(`[XAMPP MySQL] Running in resilient in-memory mode so your app works seamlessly.`);
   }
 }
+
+// ── Forgot-password request inbox (login page → Admin Console) ───────────────
+// A user who forgot their password requests a reset from the LOGIN screen
+// (mobile number or email + the last password they remember). The server
+// verifies that last password BEFORE creating the request, so the admin only
+// ever sees identity-verified requests. Pending ones light the account's PW
+// button red in the Admin Console's Users & KYC tab.
+let inMemoryResetRequests: any[] = [];
 
 tryConnectMysql();
 
@@ -467,6 +540,20 @@ async function hydrateMemoryFromMysql(): Promise<void> {
           walletBalance: Number(row.wallet_balance) || 0,
           walletTransactions: parseWalletTransactions(row.wallet_transactions),
           password_hash: row.password_hash,
+          // Verification workflow must survive a restart: without these the
+          // Pending registrations silently read as legacy 'Approved' (they
+          // would never appear in the Admin Console queue again) and the
+          // uploaded Valid ID / business proof documents are lost.
+          verificationStatus: row.verification_status || undefined,
+          submittedAt: row.submitted_at || undefined,
+          rsbsaNumber: row.rsbsa_number || undefined,
+          validIdImage: row.valid_id_image || '',
+          businessProofImage: row.business_proof_image || '',
+          // Verification audit trail — WHO decided and WHEN (Admin Console).
+          approvedAt: row.approved_at || undefined,
+          approvedBy: row.approved_by || undefined,
+          rejectedAt: row.rejected_at || undefined,
+          rejectedBy: row.rejected_by || undefined,
         }));
 
       // Always ensure system admin account exists
@@ -493,6 +580,28 @@ async function hydrateMemoryFromMysql(): Promise<void> {
       }
 
       inMemoryUsers = mysqlUsers;
+
+      // Hydrate the forgot-password request inbox so a pending request
+      // survives a server restart (the red PW button must not lie).
+      try {
+        const [pwrRows]: any = await mysqlPool.query(
+          'SELECT * FROM password_reset_requests ORDER BY requested_at DESC'
+        );
+        if (Array.isArray(pwrRows)) {
+          inMemoryResetRequests = pwrRows.map((r: any) => ({
+            id: r.id,
+            userId: r.user_id,
+            userName: r.user_name,
+            userRole: r.user_role,
+            contact: r.contact,
+            status: r.status || 'pending',
+            requestedAt: r.requested_at,
+            resolvedAt: r.resolved_at || undefined,
+          }));
+        }
+      } catch (pwrErr) {
+        console.error('Hydrate password reset requests error:', pwrErr);
+      }
     }
 
     const [prodRows]: any = await mysqlPool.query('SELECT * FROM products ORDER BY created_at DESC');
@@ -723,6 +832,7 @@ async function hydrateOrdersJobsMessages(): Promise<void> {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
+    build: SERVER_BUILD,
     appName: 'VeggieConnect Dumaguete',
     location: 'Dumaguete City, Negros Oriental, Philippines',
     currency: 'PHP (₱)',
@@ -768,7 +878,9 @@ app.post('/api/auth/signup', async (req, res) => {
       ? req.body.businessProofImage
       : '';
 
-    const trimmedName = name.trim();
+    // Auto-capitalize: "juan dela cruz" is stored as "Juan Dela Cruz" — the
+    // first letter of every lowercase word is capitalized in the details.
+    const trimmedName = titleCaseName(name);
     const normName = trimmedName.toLowerCase();
     const rawEmail = (email || '').trim();
     const normEmail = rawEmail.toLowerCase();
@@ -863,7 +975,7 @@ app.post('/api/auth/signup', async (req, res) => {
       location: location || 'Dumaguete City, Negros Oriental',
       latitude: req.body.latitude !== undefined && !isNaN(parseFloat(req.body.latitude)) ? parseFloat(req.body.latitude) : undefined,
       longitude: req.body.longitude !== undefined && !isNaN(parseFloat(req.body.longitude)) ? parseFloat(req.body.longitude) : undefined,
-      farmName: role === 'farmer' ? farmName || `${trimmedName}'s Farm` : undefined,
+      farmName: role === 'farmer' ? titleCaseName(farmName || '') || `${trimmedName}'s Farm` : undefined,
       avatar: req.body.avatar || '',
       status: 'active',
       // DA verification workflow: registrations are NEVER granted immediate
@@ -1026,6 +1138,11 @@ app.post('/api/auth/login', async (req, res) => {
             // store is cleared) or a Pending registration could log in.
             verificationStatus: row.verification_status || undefined,
             submittedAt: row.submitted_at || undefined,
+            // Document images ride along so the client's saved registry copy
+            // keeps them (the login response replaces the local record).
+            rsbsaNumber: row.rsbsa_number || undefined,
+            validIdImage: row.valid_id_image || '',
+            businessProofImage: row.business_proof_image || '',
             password_hash: row.password_hash,
           };
           inMemoryUsers.push(user);
@@ -1098,7 +1215,7 @@ app.post('/api/auth/login', async (req, res) => {
 app.put('/api/users/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, email, phone, role, location, latitude, longitude, farmName, avatar, verified, status, bio, walletBalance, walletTransactions, verificationStatus, validIdImage, rsbsaNumber, businessProofImage, submittedAt } = req.body;
+    const { name, email, phone, role, location, latitude, longitude, farmName, avatar, verified, status, bio, walletBalance, walletTransactions, verificationStatus, validIdImage, rsbsaNumber, businessProofImage, submittedAt, verificationDecisionBy } = req.body;
 
     // DA verification workflow — the Admin Console's Approve/Reject action sends
     // verificationStatus ('Pending' | 'Approved' | 'Rejected'). Approving also
@@ -1106,7 +1223,45 @@ app.put('/api/users/:id', async (req, res) => {
     // app keeps working without a migration.
     const VALID_VERIFICATION = ['Pending', 'Approved', 'Rejected'];
 
+    // ── Verification audit trail ────────────────────────────────────────────
+    // Stamp WHO decided and WHEN — but ONLY when the decision actually
+    // changes. Routine profile syncs resend the current verificationStatus,
+    // and without this guard every sync would rewrite the decision date.
+    //   null  = keep the stored value (COALESCE-friendly)
+    //   ''    = clear the stored value (COALESCE('' , x) = '')
     const userIdx = inMemoryUsers.findIndex((u) => u.id === id);
+    const prevVerification =
+      userIdx >= 0 ? inMemoryUsers[userIdx].verificationStatus || 'Pending' : 'Pending';
+    const newVerification =
+      verificationStatus !== undefined && VALID_VERIFICATION.includes(verificationStatus)
+        ? verificationStatus
+        : prevVerification;
+    let approvedAtToSet: string | null = null;
+    let approvedByToSet: string | null = null;
+    let rejectedAtToSet: string | null = null;
+    let rejectedByToSet: string | null = null;
+    if (newVerification !== prevVerification) {
+      const decider =
+        (typeof verificationDecisionBy === 'string' && verificationDecisionBy.trim()) || 'DA Admin';
+      if (newVerification === 'Approved') {
+        approvedAtToSet = new Date().toISOString();
+        approvedByToSet = decider;
+        rejectedAtToSet = '';
+        rejectedByToSet = '';
+      } else if (newVerification === 'Rejected') {
+        rejectedAtToSet = new Date().toISOString();
+        rejectedByToSet = decider;
+        approvedAtToSet = '';
+        approvedByToSet = '';
+      } else {
+        // Re-queued for review → the previous decision no longer stands.
+        approvedAtToSet = '';
+        approvedByToSet = '';
+        rejectedAtToSet = '';
+        rejectedByToSet = '';
+      }
+    }
+
     if (userIdx >= 0) {
       inMemoryUsers[userIdx] = {
         ...inMemoryUsers[userIdx],
@@ -1130,6 +1285,10 @@ app.put('/api/users/:id', async (req, res) => {
         rsbsaNumber: rsbsaNumber !== undefined ? rsbsaNumber : inMemoryUsers[userIdx].rsbsaNumber,
         businessProofImage: businessProofImage !== undefined ? businessProofImage : inMemoryUsers[userIdx].businessProofImage,
         submittedAt: submittedAt !== undefined ? submittedAt : inMemoryUsers[userIdx].submittedAt,
+        approvedAt: approvedAtToSet !== null ? approvedAtToSet || undefined : inMemoryUsers[userIdx].approvedAt,
+        approvedBy: approvedByToSet !== null ? approvedByToSet || undefined : inMemoryUsers[userIdx].approvedBy,
+        rejectedAt: rejectedAtToSet !== null ? rejectedAtToSet || undefined : inMemoryUsers[userIdx].rejectedAt,
+        rejectedBy: rejectedByToSet !== null ? rejectedByToSet || undefined : inMemoryUsers[userIdx].rejectedBy,
         walletBalance:
           walletBalance !== undefined && walletBalance !== null && !isNaN(parseFloat(walletBalance))
             ? Math.max(0, Math.round(parseFloat(walletBalance) * 100) / 100)
@@ -1162,6 +1321,10 @@ app.put('/api/users/:id', async (req, res) => {
             rsbsa_number = COALESCE(?, rsbsa_number),
             business_proof_image = COALESCE(?, business_proof_image),
             submitted_at = COALESCE(?, submitted_at),
+            approved_at = COALESCE(?, approved_at),
+            approved_by = COALESCE(?, approved_by),
+            rejected_at = COALESCE(?, rejected_at),
+            rejected_by = COALESCE(?, rejected_by),
             wallet_balance = COALESCE(?, wallet_balance),
             wallet_transactions = COALESCE(?, wallet_transactions)
            WHERE id = ?`,
@@ -1185,6 +1348,10 @@ app.put('/api/users/:id', async (req, res) => {
             typeof rsbsaNumber === 'string' && rsbsaNumber ? rsbsaNumber : null,
             typeof businessProofImage === 'string' && businessProofImage ? businessProofImage : null,
             typeof submittedAt === 'string' && submittedAt ? submittedAt : null,
+            approvedAtToSet, // '' clears, null keeps, ISO string stamps
+            approvedByToSet,
+            rejectedAtToSet,
+            rejectedByToSet,
             walletBalance !== undefined && walletBalance !== null && !isNaN(parseFloat(walletBalance))
               ? Math.max(0, Math.round(parseFloat(walletBalance) * 100) / 100)
               : null,
@@ -1249,7 +1416,7 @@ app.get('/api/users', async (req, res) => {
   try {
     if (mysqlPool && isMysqlConnected) {
       const [rows]: any = await mysqlPool.query(
-        `SELECT id, name, email, phone, role, location, latitude, longitude, farm_name AS farmName, avatar_url AS avatar, status, is_verified AS verified, verification_status AS verificationStatus, rsbsa_number AS rsbsaNumber, submitted_at AS submittedAt, wallet_balance AS walletBalance, wallet_transactions AS walletTransactionsRaw FROM users WHERE role <> 'transporter'`
+        `SELECT id, name, email, phone, role, location, latitude, longitude, farm_name AS farmName, avatar_url AS avatar, status, is_verified AS verified, verification_status AS verificationStatus, rsbsa_number AS rsbsaNumber, submitted_at AS submittedAt, approved_at AS approvedAt, approved_by AS approvedBy, rejected_at AS rejectedAt, rejected_by AS rejectedBy, wallet_balance AS walletBalance, wallet_transactions AS walletTransactionsRaw FROM users WHERE role <> 'transporter'`
       );
       if (rows && rows.length > 0) {
         return res.json(
@@ -1267,6 +1434,10 @@ app.get('/api/users', async (req, res) => {
               verificationStatus: r.verificationStatus || mem?.verificationStatus || 'Pending',
               rsbsaNumber: r.rsbsaNumber || mem?.rsbsaNumber || '',
               submittedAt: r.submittedAt || mem?.submittedAt,
+              approvedAt: r.approvedAt || mem?.approvedAt,
+              approvedBy: r.approvedBy || mem?.approvedBy,
+              rejectedAt: r.rejectedAt || mem?.rejectedAt,
+              rejectedBy: r.rejectedBy || mem?.rejectedBy,
               // Document images are only needed by the DA Admin review flow —
               // the admin console fetches them from its own local registry, so
               // the public user directory never ships megabytes of ID photos.
@@ -1298,6 +1469,86 @@ app.get('/api/users', async (req, res) => {
         return copy;
       })
     );
+  }
+});
+
+// ── DA Admin Console · verification documents ────────────────────────────────
+// GET /api/users/:id/documents returns ONLY the uploaded verification
+// documents (Valid Government ID, business proof, RSBSA number) for one
+// account. The VerificationReviewModal fetches this lazily when the admin
+// opens a queue entry, so the directory endpoints never ship megabytes of ID
+// photos on every poll while the admin — on ANY device — still sees the exact
+// documents the applicant uploaded at registration (source of truth: MySQL,
+// with the in-memory store as fallback).
+app.get('/api/users/:id/documents', async (req, res) => {
+  try {
+    const { id } = req.params;
+    let validIdImage = '';
+    let businessProofImage = '';
+    let rsbsaNumber = '';
+    let verificationStatus: string | undefined;
+    let submittedAt: string | undefined;
+    let approvedAt: string | undefined;
+    let approvedBy: string | undefined;
+    let rejectedAt: string | undefined;
+    let rejectedBy: string | undefined;
+
+    if (mysqlPool && isMysqlConnected) {
+      try {
+        const [rows]: any = await mysqlPool.query(
+          `SELECT valid_id_image, business_proof_image, rsbsa_number, verification_status, submitted_at, approved_at, approved_by, rejected_at, rejected_by FROM users WHERE id = ? LIMIT 1`,
+          [id]
+        );
+        if (rows && rows.length > 0) {
+          const row = rows[0];
+          validIdImage = typeof row.valid_id_image === 'string' ? row.valid_id_image : '';
+          businessProofImage = typeof row.business_proof_image === 'string' ? row.business_proof_image : '';
+          rsbsaNumber = row.rsbsa_number || '';
+          verificationStatus = row.verification_status || undefined;
+          submittedAt = row.submitted_at || undefined;
+          approvedAt = row.approved_at || undefined;
+          approvedBy = row.approved_by || undefined;
+          rejectedAt = row.rejected_at || undefined;
+          rejectedBy = row.rejected_by || undefined;
+        }
+      } catch (e) {
+        // Fall through to the in-memory store below.
+      }
+    }
+
+    if (!validIdImage && !businessProofImage) {
+      const mem = inMemoryUsers.find((u) => u.id === id);
+      if (mem) {
+        validIdImage = mem.validIdImage || validIdImage;
+        businessProofImage = mem.businessProofImage || businessProofImage;
+        rsbsaNumber = rsbsaNumber || mem.rsbsaNumber || '';
+        verificationStatus = verificationStatus || mem.verificationStatus;
+        submittedAt = submittedAt || mem.submittedAt;
+        approvedAt = approvedAt || mem.approvedAt;
+        approvedBy = approvedBy || mem.approvedBy;
+        rejectedAt = rejectedAt || mem.rejectedAt;
+        rejectedBy = rejectedBy || mem.rejectedBy;
+      }
+    }
+
+    res.json({
+      id,
+      validIdImage,
+      businessProofImage,
+      rsbsaNumber,
+      verificationStatus,
+      submittedAt,
+      approvedAt,
+      approvedBy,
+      rejectedAt,
+      rejectedBy,
+      // Diagnostics so the review modal can say WHY an image is missing
+      // instead of a generic "legacy account" note.
+      mysqlConnected: Boolean(mysqlPool && isMysqlConnected),
+      found: Boolean(validIdImage || businessProofImage),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Could not load verification documents.' });
   }
 });
 
@@ -1534,6 +1785,14 @@ app.get('/api/products', async (req, res) => {
 });
 
 // 5. Products: Create new / Upsert
+// DA price floor: the DA Suggested Direct price is the MINIMUM a farmer may
+// ask for a covered crop — same matcher the farmer's form uses at input time.
+function daSuggestedFloorFor(cropName: unknown): number | null {
+  const da = findMatchingDAPrice(String(cropName || ''));
+  const suggested = da ? parseFloat(String(da.suggestedDirectFarmPrice)) : NaN;
+  return isFinite(suggested) && suggested > 0 ? suggested : null;
+}
+
 app.post('/api/products', async (req, res) => {
   try {
     const p = req.body;
@@ -1571,6 +1830,17 @@ app.post('/api/products', async (req, res) => {
     };
 
     const isSm = newProduct.sellerStoreName === 'VeggieConnect Supermarket' || newProduct.sellerStatus === 'bought_and_stocked' || newProduct.id.startsWith('sm-');
+
+    // DA floor: farmer listings may not be created below the DA Suggested
+    // Direct price (supermarket-owned stock is exempt).
+    if (!isSm) {
+      const floor = daSuggestedFloorFor(newProduct.name);
+      if (floor !== null && (parseFloat(String(newProduct.pricePerUnit)) || 0) < floor) {
+        return res.status(400).json({
+          error: `DA price floor: ${newProduct.name} cannot be listed below ₱${floor.toFixed(2)}/kg (DA Suggested Direct price).`,
+        });
+      }
+    }
     const norm = (s: string) => (s || '').toLowerCase().replace(/\(.*?\)/g, '').replace(/[^a-z0-9]/g, '').trim();
 
     let existingIdx = inMemoryProducts.findIndex((prod) => prod.id === newProduct.id);
@@ -1580,13 +1850,42 @@ app.post('/api/products', async (req, res) => {
         return prodIsSm && norm(prod.name) === norm(newProduct.name);
       });
     }
+    if (existingIdx === -1 && !isSm) {
+      // A farmer RE-LISTING the same crop must MERGE into their existing
+      // listing instead of duplicating it — the farmer's My Crops and the
+      // admin's Crops section render one card per crop per farmer. The merged
+      // card keeps the original record's id (orders referencing it stay
+      // valid), takes the NEW price, and sums the stock.
+      // Match: same farmer (by id, or farm + farmer name when ids are absent),
+      // same normalized crop name ("Okra (Lady Finger)" ≈ "Okra"), same unit —
+      // a "kg" listing and a "bundle" listing are different sellable items and
+      // stay separate. NEVER merges into a supermarket-owned record (those
+      // merge separately above).
+      existingIdx = inMemoryProducts.findIndex((prod) => {
+        if (isWarehouseOwnedProduct(prod)) return false;
+        const sameFarmer =
+          newProduct.farmerId && prod.farmerId
+            ? String(prod.farmerId) === String(newProduct.farmerId)
+            : norm(prod.farmName) === norm(newProduct.farmName) &&
+              norm(prod.farmerName) === norm(newProduct.farmerName);
+        return (
+          sameFarmer &&
+          norm(prod.name) === norm(newProduct.name) &&
+          String(prod.unit || 'kg') === String(newProduct.unit || 'kg')
+        );
+      });
+    }
 
     if (existingIdx >= 0) {
       const existing = inMemoryProducts[existingIdx];
       newProduct.id = existing.id;
       newProduct.stockQuantity = (existing.stockQuantity || 0) + (newProduct.stockQuantity || 0);
       newProduct.boughtQuantity = Math.max(existing.boughtQuantity || 0, newProduct.boughtQuantity || 0, newProduct.stockQuantity);
-      inMemoryProducts[existingIdx] = { ...existing, ...newProduct };
+      const merged = { ...existing, ...newProduct };
+      // Social proof survives the merge — this is a re-listing, not a new product.
+      merged.rating = existing.rating ?? newProduct.rating;
+      merged.reviewsCount = Math.max(existing.reviewsCount || 0, newProduct.reviewsCount || 0);
+      inMemoryProducts[existingIdx] = merged;
     } else {
       inMemoryProducts.unshift(newProduct);
     }
@@ -1680,14 +1979,50 @@ app.put('/api/products/:id', async (req, res) => {
     // If not found in inMemoryProducts, populate from body
     item = { id, ...updates };
     inMemoryProducts.push(item);
-  } else {
-    Object.assign(item, updates);
+  }
+  // Supermarket-owned stock keeps its ORIGINAL procurement cost; farmer
+  // listings follow every price the farmer sets.
+  const ownedStock = Boolean(
+    item &&
+      (item.sellerStoreName === 'VeggieConnect Supermarket' ||
+        item.sellerStatus === 'bought_and_stocked' ||
+        item.farmerId === 'admin-main' ||
+        String(id).startsWith('sm-'))
+  );
+  // DA floor: a farmer may not LOWER their asking price below the DA Suggested
+  // Direct price. Raising toward/above the floor is always allowed; legacy rows
+  // already below the floor keep their stored price unless it is changed.
+  if (updates.pricePerUnit !== undefined && !ownedStock) {
+    const floor = daSuggestedFloorFor(item.name);
+    const newPrice = parseFloat(String(updates.pricePerUnit));
+    const currentPrice = parseFloat(String(item.pricePerUnit)) || 0;
+    if (floor !== null && isFinite(newPrice) && newPrice < floor && newPrice < currentPrice) {
+      return res.status(400).json({
+        error: `DA price floor: ${item.name} cannot be priced below ₱${floor.toFixed(2)}/kg (DA Suggested Direct price).`,
+      });
+    }
+  }
+  Object.assign(item, updates);
+  // The farmer's asking price is whatever THEY last set — never derived from
+  // the DA Suggested Direct price. Keep the legacy farmgateAskingPrice field
+  // in lockstep with pricePerUnit (in memory) so admin views (which prefer
+  // that field) never show a stale pre-edit price.
+  if (updates.pricePerUnit !== undefined && !ownedStock && parseFloat(updates.pricePerUnit) > 0) {
+    item.farmgateAskingPrice = parseFloat(updates.pricePerUnit);
   }
 
   if (mysqlPool && isMysqlConnected) {
     try {
+      // SQL mirror of the memory sync above: farmer listings keep
+      // farmgate_asking_price equal to the latest pricePerUnit.
+      const effectiveFarmgate =
+        updates.farmgateAskingPrice !== undefined
+          ? parseFloat(updates.farmgateAskingPrice)
+          : updates.pricePerUnit !== undefined && !ownedStock
+            ? parseFloat(updates.pricePerUnit)
+            : null;
       await mysqlPool.query(
-        `UPDATE products SET 
+        `UPDATE products SET
           name = COALESCE(?, name),
           category = COALESCE(?, category),
           variety = COALESCE(?, variety),
@@ -1732,7 +2067,7 @@ app.put('/api/products/:id', async (req, res) => {
           updates.sellerStatus || null,
           updates.brokerStatus || null,
           updates.sellerStoreName || null,
-          updates.farmgateAskingPrice !== undefined ? parseFloat(updates.farmgateAskingPrice) : null,
+          effectiveFarmgate,
           updates.boughtQuantity !== undefined ? parseInt(updates.boughtQuantity, 10) : null,
           updates.boughtAt || null,
           updates.sourcingRegion || null,
@@ -1880,16 +2215,19 @@ const cropKeysMatch = (a: any, b: any): boolean => {
  * With this materialization the delivered quantity becomes a REAL warehouse
  * record (id sm-<crop>) that request-lot deductions then reduce.
  */
-async function addProcurementStockToWarehouse(order: any): Promise<void> {
-  if (!order || !isSupermarketProcurement(order)) return;
-  if ((order as any).warehouseStockAdded === true) return;
-  if (order.status !== 'completed') return;
+async function addProcurementStockToWarehouse(
+  order: any
+): Promise<{ added: boolean; adds: { warehouseId: string; qty: number }[] }> {
+  const none = { added: false, adds: [] as { warehouseId: string; qty: number }[] };
+  if (!order || !isSupermarketProcurement(order)) return none;
+  if ((order as any).warehouseStockAdded === true) return none;
+  if (order.status !== 'completed') return none;
   const items = Array.isArray(order.items) ? order.items : [];
   if (items.length === 0) {
-    (order as any).warehouseStockAdded = true;
-    void saveOrderToMysql(order);
-    return;
+    setProcurementFlagsOnRealOrder(order);
+    return none;
   }
+  const adds: { warehouseId: string; qty: number }[] = [];
 
   const hubCoords = { lat: 9.308, lng: 123.3105 };
 
@@ -1914,6 +2252,7 @@ async function addProcurementStockToWarehouse(order: any): Promise<void> {
       existing.stockQuantity = (Number(existing.stockQuantity) || 0) + qty;
       existing.sellerStatus = 'bought_and_stocked';
       if (!existing.sellerStoreName) existing.sellerStoreName = 'VeggieConnect Supermarket';
+      adds.push({ warehouseId: existing.id, qty });
       if (mysqlPool && isMysqlConnected) {
         try {
           await mysqlPool.query(
@@ -1960,6 +2299,7 @@ async function addProcurementStockToWarehouse(order: any): Promise<void> {
         boughtAt: new Date().toISOString(),
         sourcingRegion: it?.farmName || it?.farmerName || 'Local Farmer Partner',
       };
+      adds.push({ warehouseId, qty });
       inMemoryProducts.unshift(newRecord);
       if (mysqlPool && isMysqlConnected) {
         try {
@@ -1988,8 +2328,155 @@ async function addProcurementStockToWarehouse(order: any): Promise<void> {
     }
   }
 
+  // Exactly-once flags must land on the REAL in-memory order — this function
+  // is often called with a shallow copy ({...order, status}), so the flag set
+  // on the copy used to vanish and every later trigger (delivery confirm,
+  // startup backfill) added the SAME kilograms again (triple-stocked shelves).
   (order as any).warehouseStockAdded = true;
-  void saveOrderToMysql(order);
+  setProcurementFlagsOnRealOrder(order);
+  return { added: adds.length > 0, adds };
+}
+
+/** Pins the exactly-once procurement flags on the REAL order row (by id). */
+function setProcurementFlagsOnRealOrder(order: any): void {
+  if (!order?.id) return;
+  const real = inMemoryOrders.find((o: any) => o && o.id === order.id);
+  if (real) {
+    (real as any).warehouseStockAdded = true;
+    void saveOrderToMysql(real);
+  }
+}
+
+/**
+ * Fulfills a SUPERMARKET PROCUREMENT order (the Admin buying a farmer's
+ * harvest for the warehouse — buyerId 'admin-main' / TX-ADM-* / buyer name
+ * containing "admin").
+ *
+ * WHY NOT deductRequestLotsForOrder: that engine sources WAREHOUSE-FIRST,
+ * which for a procurement order deducts the admin's OWN shelf stock instead
+ * of the farmer's harvest — the admin "bought" 30 kg of Calamansi, the delivery
+ * added 30 kg back, and the Stocks menu came full circle to exactly where it
+ * started ("bought 30 kg of Calamansi, still shows 30 kg") while the farmer's
+ * sold lot was never consumed.
+ *
+ * A procurement order buys THE FARMER'S LOT directly:
+ *   1. The farmer's listing is deducted the moment the order first leaves
+ *      'pending' (the purchase is committed — the admin now owns it).
+ *   2. The bought kilograms join the central warehouse stock IMMEDIATELY
+ *      (exactly-once via warehouseStockAdded), so the Stocks menu grows as
+ *      soon as the transaction is confirmed — the transport chain ("Confirm
+ *      Delivery & Stock Received in Supermarket") stays as the visual
+ *      delivery step but can no longer be the ONLY moment stock arrives.
+ *   3. The warehouse additions are recorded on the order
+ *      (procurementStockAdds) so a later cancellation reverses them out of
+ *      the warehouse while the sourcingAllocations restock returns the
+ *      farmer's kilograms.
+ */
+async function fulfillProcurementOrder(order: any): Promise<{ deducted: boolean; blocked?: boolean }> {
+  if (!order || (order as any).requestStockDeducted === true) return { deducted: false };
+  const items = Array.isArray(order.items) ? order.items : [];
+  const allocations: any[] = [];
+
+  for (const it of items) {
+    const qty = Number(it?.quantity) || 0;
+    const cropName = String(it?.produceName || '').trim();
+    if (qty <= 0 || !cropName) continue;
+
+    // The lot the admin bought: the item's own produce id when it points at a
+    // real farmer listing; otherwise the highest-stock farmer lot for the crop.
+    const buyLot =
+      inMemoryProducts.find(
+        (p: any) => p.id === it.produceId && !isWarehouseOwnedProduct(p)
+      ) ||
+      inMemoryProducts
+        .filter(
+          (p: any) =>
+            !isWarehouseOwnedProduct(p) &&
+            (Number(p.stockQuantity) || 0) > 0 &&
+            cropKeysMatch(p.name, cropName)
+        )
+        .sort((a: any, b: any) => (Number(b.stockQuantity) || 0) - (Number(a.stockQuantity) || 0))[0];
+    if (!buyLot) continue;
+
+    const take = Math.min(qty, Math.max(0, Number(buyLot.stockQuantity) || 0));
+    if (take <= 0) continue;
+    buyLot.stockQuantity = (Number(buyLot.stockQuantity) || 0) - take;
+    if (buyLot.stockQuantity === 0 && !buyLot.sellerStoreName) {
+      buyLot.sellerStatus = 'sold_out';
+    }
+    // Audit trail on the farmer's listing: how much the admin has bought from
+    // it in total (the Owned/Bought fallback lists farmers by boughtQuantity).
+    // The desk UI no longer PUTs this itself — the engine is the single
+    // writer, so the figure can never double-count.
+    buyLot.boughtQuantity = (Number(buyLot.boughtQuantity) || 0) + take;
+    buyLot.boughtAt = new Date().toISOString();
+    if (mysqlPool && isMysqlConnected) {
+      mysqlPool
+        .query(
+          'UPDATE products SET stock_quantity = GREATEST(0, stock_quantity - ?), bought_quantity = COALESCE(bought_quantity, 0) + ?, bought_at = ?, seller_status = CASE WHEN stock_quantity = 0 AND seller_store_name IS NULL THEN "sold_out" ELSE seller_status END WHERE id = ?',
+          [take, take, buyLot.boughtAt, buyLot.id]
+        )
+        .catch((e: any) => console.log('MySQL procurement deduct err:', e));
+    }
+    allocations.push({
+      produceId: buyLot.id,
+      cropName,
+      quantity: take,
+      farmgatePrice: Number(buyLot.farmgateAskingPrice ?? buyLot.pricePerUnit) || 0,
+      farmerId: buyLot.farmerId,
+      farmerName: buyLot.farmerName,
+      farmName: buyLot.farmName,
+      isWarehouse: false,
+    });
+  }
+
+  // EMPTY ALLOCATIONS IS NOT "NOTHING HAPPENED": the admin pressed
+  // "Confirm Purchase" and PAID — the transaction is committed. When the
+  // farmer's lot reads 0 at fulfillment time (the desk UI deducted it
+  // optimistically just before posting the order — buying the WHOLE listing
+  // always did this), take = 0 for every line and the old early-return
+  // skipped the warehouse add ENTIRELY: the bought quantity never appeared
+  // in the Stocks menu (only a later delivery confirm could have rescued
+  // it). Stock the ORDER's quantities unconditionally — the warehouse add is
+  // exactly-once via warehouseStockAdded regardless of this path.
+  if (allocations.length === 0) {
+    (order as any).requestStockDeducted = true; // fulfillment committed — never re-run
+    const committed = await addProcurementStockToWarehouse({ ...order, status: 'completed' });
+    if (committed.adds.length > 0) {
+      (order as any).procurementStockAdds = committed.adds;
+    }
+    console.log(
+      `[VeggieConnect Backend] Procurement #${order.id}: farmer lot already deducted before fulfillment — committed the purchase and stocked the warehouse (${(order.items || [])
+        .map((it: any) => `${it.quantity}kg ${it.produceName}`)
+        .join(', ')}).`
+    );
+    return { deducted: false };
+  }
+  (order as any).sourcingAllocations = allocations;
+  (order as any).requestStockDeducted = true;
+  (order as any).farmerCostTotal =
+    Math.round(allocations.reduce((s, a) => s + a.quantity * a.farmgatePrice, 0) * 100) / 100;
+
+  // Purchase committed → the bought kilograms join the warehouse NOW.
+  const result = await addProcurementStockToWarehouse({ ...order, status: 'completed' });
+  if (result.adds.length > 0) {
+    (order as any).procurementStockAdds = result.adds;
+    const real = inMemoryOrders.find((o: any) => o && o.id === order.id);
+    if (real) (real as any).procurementStockAdds = result.adds;
+  }
+  console.log(
+    `[VeggieConnect Backend] Procurement #${order.id}: bought ${allocations
+      .map((a) => `${a.quantity}kg ${a.cropName}`)
+      .join(', ')} from farmers — deducted their lots and stocked the warehouse.`
+  );
+  return { deducted: true };
+}
+
+/** Stock movement for an order leaving 'pending': procurement orders buy the
+ *  farmer's lot directly; buyer orders run the warehouse-first sourcing engine. */
+async function fulfillOrderStock(order: any): Promise<{ deducted: boolean; blocked?: boolean; error?: string; quote?: any }> {
+  if (isSupermarketProcurement(order)) return fulfillProcurementOrder(order);
+  return deductRequestLotsForOrder(order);
 }
 
 /**
@@ -2029,8 +2516,9 @@ function deductRequestLotsForOrder(order: any): {
   const cropNamesMatch = (productName: any, requested: string) =>
     cropKeysMatch(productName, requested);
 
-  // ── PASS 1: plan every request-lot line BEFORE touching any stock ─────────
-  // Each line is fulfilled warehouse-first (already-paid shelf stock); any
+  // ── PASS 1: plan every buyer line BEFORE touching any stock ───────────────
+  // EVERY buyer line is fulfilled at first-fulfillment (since v4.6 nothing is
+  // deducted at submission): warehouse-first (already-paid shelf stock); any
   // shortfall is sourced from farmer harvest lots sorted by farmgate price
   // ASC and allocated sequentially until the buyer's quantity is met.
   // Guardrails run on the PLAN so a loss-making crop blocks the whole
@@ -2043,8 +2531,10 @@ function deductRequestLotsForOrder(order: any): {
   let blockedPlan: ReturnType<typeof buildSourcingPlan> | null = null;
 
   for (const it of order.items || []) {
-    const pid = String(it.produceId || '');
-    if (pid && !pid.startsWith('req-prod-')) continue; // direct basket lot — deducted at checkout
+    // No id-based skip: EVERY buyer line deducts at first fulfillment. Direct
+    // basket ids (real produce ids from the buyer's cart) flow through the
+    // same warehouse-first / farmer-lot allocation as request lots — nothing
+    // was deducted when the request was submitted.
     const qty = Number(it.quantity) || 0;
     if (qty <= 0) continue;
     const name = String(it.produceName || '').trim();
@@ -2196,44 +2686,16 @@ function deductRequestLotsForOrder(order: any): {
 // sourcing pool. Only when the admin holds no warehouse record for the crop
 // does the item's own produce record (exact id) act as the target, keeping
 // legacy direct-basket behaviour for crops the admin never stocked.
-function resolveBuyerStockTarget(item: any): any | undefined {
-  const isWarehouseOwned = (p: any) =>
-    p.sellerStoreName === 'VeggieConnect Supermarket' ||
-    p.sellerStatus === 'bought_and_stocked' ||
-    p.farmName === 'VeggieConnect Supermarket' ||
-    p.farmerName === 'VeggieConnect Central Produce Hub' ||
-    p.farmerId === 'admin-main' ||
-    String(p.id || '').startsWith('sm-');
-  const cropNamesMatch = (productName: any, requested: string) => {
-    const a = String(productName || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
-    const b = String(requested || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
-    if (!a || !b) return false;
-    return a === b || a.includes(b) || b.includes(a);
-  };
-  const requestedName = String(item.produceName || '').trim();
-  // 1. Warehouse-owned record for this crop (highest stock first) — the record
-  //    the admin's Stocks menu shows for the crop.
-  const warehouseTarget = inMemoryProducts
-    .filter((p) => isWarehouseOwned(p) && cropNamesMatch(p.name, requestedName))
-    .sort((a, b) => (Number(b.stockQuantity) || 0) - (Number(a.stockQuantity) || 0))[0];
-  if (warehouseTarget) return warehouseTarget;
-  // 2. Exact produce id (direct basket lot on a record the admin never stocked).
-  const byId = inMemoryProducts.find((p) => p.id === item.produceId);
-  if (byId) return byId;
-  // 3. Exact crop-name match on any product (last resort).
-  const name = requestedName.toLowerCase();
-  return inMemoryProducts.find((p) => (p.name || '').trim().toLowerCase() === name);
-}
-
-app.post('/api/orders', (req, res) => {
+app.post('/api/orders', async (req, res) => {
   const order = req.body;
 
   // ── Stock Validation (overselling guard) ──────────────────────────────────
-  // Every ordered item that matches a known product must fit within its
-  // available shelf stock (warehouse-first resolution). Admin procurement
-  // orders (TX-ADM-*) are skipped — they ADD warehouse stock rather than
-  // consume it. Items with no matching product are custom buyer sourcing
-  // requests (Admin decides).
+  // EVERY buyer line is validated against the TOTAL availability for that
+  // crop — the warehouse shelf plus every farmer's listed kilograms. The
+  // Market shows one combined entry per crop (v4.5) and the Admin fulfils
+  // with the multi-farmer split allocation (v4.6), so the ceiling must be
+  // the combined figure too. Admin procurement orders (TX-ADM-*) are skipped
+  // — they ADD warehouse stock rather than consume it.
   const isAdminProcurement =
     String(order.id || '').startsWith('TX-ADM-') ||
     order.buyerId === 'admin-main' ||
@@ -2243,32 +2705,22 @@ app.post('/api/orders', (req, res) => {
     for (const it of order.items) {
       const qty = Number(it.quantity) || 0;
       if (qty <= 0) continue;
-      const pid = String(it.produceId || '');
-      // REQUEST lots ("req-prod-*", Cart ▸ Request Crops) may be sourced across
-      // the warehouse shelf AND several farmer harvest lots — the multi-farmer
-      // split allocation at fulfillment covers single-farmer shortfalls. Their
-      // ceiling is the TOTAL availability for that crop, not one shelf record.
-      if (isRequestLotItem(pid)) {
-        const name = String(it.produceName || '').trim();
-        const totalAvailability = inMemoryProducts
-          .filter(
-            (p: any) =>
-              (Number(p.stockQuantity) || 0) > 0 &&
-              cropKeysMatch(p.name, name)
-          )
-          .reduce((s: number, p: any) => s + (Number(p.stockQuantity) || 0), 0);
-        if (qty > totalAvailability) {
-          problems.push(
-            `${name}: requested ${qty}${it.unit || 'kg'} but only ${totalAvailability}${(it.unit || 'kg')} available across the market and farmer listings`
-          );
-        }
-        continue;
-      }
-      const prod = resolveBuyerStockTarget(it);
-      if (!prod) continue;
-      const stock = Number(prod.stockQuantity) || 0;
-      if (qty > stock) {
-        problems.push(`${it.produceName}: requested ${qty}${it.unit || 'kg'} but only ${stock}${prod.unit || 'kg'} on the shelf`);
+      const name = String(it.produceName || '').trim();
+      if (!name) continue;
+      const totalAvailability = inMemoryProducts
+        .filter(
+          (p: any) =>
+            (Number(p.stockQuantity) || 0) > 0 &&
+            cropKeysMatch(p.name, name)
+        )
+        .reduce((s: number, p: any) => s + (Number(p.stockQuantity) || 0), 0);
+      // A crop that exists NOWHERE (totalAvailability === 0) is a CUSTOM buyer
+      // sourcing request — the Admin decides how to source it, so it passes
+      // (legacy behavior). The ceiling only applies when matching stock exists.
+      if (totalAvailability > 0 && qty > totalAvailability) {
+        problems.push(
+          `${name}: requested ${qty}${it.unit || 'kg'} but only ${totalAvailability}${(it.unit || 'kg')} available across the market and farmer listings`
+        );
       }
     }
     if (problems.length > 0) {
@@ -2279,42 +2731,59 @@ app.post('/api/orders', (req, res) => {
     }
   }
 
-  inMemoryOrders.unshift(order);
-  void saveOrderToMysql(order);
-
-  // Deduct stock for all ordered items in server memory and database.
-  // Admin procurement orders (TX-ADM-*) are SKIPPED: they move the crop from
-  // the farmer's listing into the supermarket's Owned/Bought (the client
-  // already PUT the farmer's remaining stock), and the quantity only reaches
-  // the warehouse when the haul is delivered — via
-  // addProcurementStockToWarehouse. Deducting here double-reduced the
-  // farmer's listing once more on every procurement.
-  //
-  // Buyer items deduct from the WAREHOUSE record (resolveBuyerStockTarget):
-  // direct basket lots (real produce ids from the buyer's cart) deduct HERE at
-  // checkout. Request lots (req-prod-*) are deliberately skipped — they deduct
-  // exactly once when the admin first fulfills the request (PUT transition,
-  // guarded by the order's requestStockDeducted flag), so charging them here
-  // as well would double-deduct the shelf.
-  if (Array.isArray(order.items) && !isSupermarketProcurement(order)) {
-    for (const it of order.items) {
-      const pid = String(it.produceId || '');
-      if (pid.startsWith('req-prod-')) continue; // request lots deduct at fulfillment
-      const prod = resolveBuyerStockTarget(it);
-      if (prod) {
-        prod.stockQuantity = Math.max(0, (prod.stockQuantity || 0) - (it.quantity || 0));
-        if (prod.stockQuantity === 0 && !prod.sellerStoreName) {
-          prod.sellerStatus = 'sold_out';
-        }
-      }
-      if (mysqlPool && isMysqlConnected) {
-        mysqlPool.query(
-          'UPDATE products SET stock_quantity = GREATEST(0, stock_quantity - ?) WHERE id = ?',
-          [it.quantity || 0, prod ? prod.id : it.produceId]
-        ).catch((e) => console.log('MySQL stock deduct err:', e));
-      }
+  // ── Order-level bulk discount (₱100 off at 90 kg+) ────────────────────────
+  // The buyer pays totalAmount at the depot, so the discount is enforced HERE
+  // on the server as the single source of truth — an older client that still
+  // sends the undiscounted total gets normalized, and one that already
+  // applied it is left as-is. Admin procurement hauls are exempt. The
+  // platform absorbs the promo: the admin commission shrinks by the same
+  // ₱100 (never below zero); farmers keep their full farmgate earnings.
+  if (!isAdminProcurement) {
+    const kgTotal = (Array.isArray(order.items) ? order.items : []).reduce(
+      (s: number, it: any) =>
+        String(it?.unit || 'kg').toLowerCase() === 'kg' ? s + (Number(it?.quantity) || 0) : s,
+      0
+    );
+    const serverDiscount = kgTotal >= BULK_DISCOUNT_MIN_KG ? BULK_DISCOUNT_PESOS : 0;
+    // A discount sent by the client is ALREADY deducted from totalAmount, so
+    // add it back to recover the pre-discount base before applying ours.
+    const base = Math.max(0, (Number(order.totalAmount) || 0) + (Number(order.bulkDiscount) || 0));
+    order.bulkDiscount = serverDiscount;
+    order.totalAmount = Math.max(0, Math.round((base - serverDiscount) * 100) / 100);
+    if (serverDiscount > 0 && order.adminCommissionTotal !== undefined) {
+      order.adminCommissionTotal = Math.max(
+        0,
+        Math.round(((Number(order.adminCommissionTotal) || 0) - serverDiscount) * 100) / 100
+      );
     }
   }
+
+  // The order row must be IN the ledger BEFORE fulfillment runs: the
+  // procurement engine pins its exactly-once flags (warehouseStockAdded /
+  // requestStockDeducted) on the REAL in-memory order found by id. When the
+  // fulfillment ran first (old order), the row wasn't there yet, the pins
+  // silently missed, and the later "Confirm Delivery" transition added the
+  // SAME kilograms to the warehouse a second time (double-stocked Stocks).
+  inMemoryOrders.unshift(order);
+
+  // Procurement orders arriving ALREADY past 'pending' (imports/replays) are
+  // fulfilled right here — the normal fulfillment pass only runs on PUT
+  // status transitions, so such a row would otherwise never deduct the
+  // farmer's lot nor stock the warehouse.
+  if (isSupermarketProcurement(order) && FULFILLMENT_STATUSES.includes(order.status)) {
+    await fulfillProcurementOrder(order);
+  }
+
+  void saveOrderToMysql(order);
+
+  // NO stock deduction at request time. A buyer submission is a PURCHASE
+  // REQUEST (status 'pending') — the Admin confirms it, buys the farmer's
+  // product and resells it to the buyer. Deducting here used to drain the
+  // farmer's listing the moment the buyer pressed submit (v4.6 bug). Farmer/
+  // warehouse stock is deducted exactly once when the order FIRST leaves
+  // 'pending': PUT /api/orders/:id → deductRequestLotsForOrder (guarded by
+  // the order's requestStockDeducted flag) allocates across the warehouse
+  // shelf and the individual farmer lots and persists the deduction.
 
   // If order is direct delivery (buyer delivery or supermarket procurement haul), automatically create/update a transport job
   if (order.deliveryType === 'direct_delivery') {
@@ -2390,13 +2859,12 @@ app.put('/api/orders/:id', async (req, res) => {
   // ── Fulfillment stock deduction ───────────────────────────────────────────
   // When an order FIRST leaves 'pending' into ANY active fulfillment status
   // (confirmed / ready_for_pickup_delivery / picked_up / in_transit / completed),
-  // every REQUEST lot item (placeholder "req-prod-*" ids) is fulfilled from
-  // stock — WAREHOUSE first (already paid), then FARMER HARVEST LOTS sorted by
-  // farmgate price ASC, allocated and deducted sequentially across farmers
-  // until the buyer's quantity is met (multi-farmer split allocation). The
-  // sourcing allocations, weighted average sourcing cost and the admin's net
-  // profit are recorded on the order. Exactly once (guarded by the order's
-  // requestStockDeducted flag).
+  // EVERY buyer line is fulfilled from stock — WAREHOUSE first (already paid),
+  // then FARMER HARVEST LOTS sorted by farmgate price ASC, allocated and
+  // deducted sequentially across farmers until the buyer's quantity is met
+  // (multi-farmer split allocation). The sourcing allocations, weighted
+  // average sourcing cost and the admin's net profit are recorded on the
+  // order. Exactly once (guarded by the order's requestStockDeducted flag).
   //
   // WHY ANY STATUS: orders can be completed through several desks (Fulfill
   // Buyer Request → confirmed, "Mark Delivered", receipt "Mark Order as
@@ -2404,17 +2872,18 @@ app.put('/api/orders/:id', async (req, res) => {
   // transition deducted, so completing an order through any other desk left
   // the sold quantity permanently on the admin's Stocks menu.
   //
-  // Direct basket lots (real produce ids) are skipped: their stock was already
-  // deducted by POST /api/orders at checkout, and fulfillment must never
-  // deduct them twice. The Admin client mirrors the deduction visually only
-  // (no product PUT) so exactly one deduction is ever persisted.
+  // Since v4.6 NOTHING is deducted when the request is submitted (POST
+  // /api/orders no longer touches stock), so this fulfillment pass is the
+  // single deduction point for request lots AND direct basket ids alike. The
+  // Admin client mirrors the deduction visually only (no product PUT) so
+  // exactly one deduction is ever persisted.
   const isFirstFulfillmentTransition =
     FULFILLMENT_STATUSES.includes(updates.status) &&
     previousStatus !== 'cancelled' &&
     !wasAlreadyDeducted &&
     (previousStatus === 'pending' || previousStatus === undefined);
   if (isFirstFulfillmentTransition) {
-    const sourcing = deductRequestLotsForOrder(order);
+    const sourcing = await fulfillOrderStock(order);
     // LOSS PREVENTION: a farmer asks above the fixed buyer price — refuse the
     // automatic fulfillment (nothing was deducted, nothing allocated) and hand
     // the admin a ready-to-send Price Adjustment Quote for the buyer. The
@@ -2482,24 +2951,62 @@ app.put('/api/orders/:id', async (req, res) => {
       }
     }
 
+    // ── Procurement reversal ────────────────────────────────────────────────
+    // A FULFILLED supermarket procurement order moved its kilograms twice:
+    // farmer lot → warehouse (at fulfillment). Cancelling undoes BOTH moves:
+    // the farmer kilograms come back through the sourcingAllocations restock
+    // above, and the recorded warehouse additions are reversed here —
+    // otherwise the Stocks menu keeps phantom kilograms from a buy that never
+    // happened. Clamped at zero: if the warehouse already resold the stock,
+    // the reversal takes back only what is physically there.
+    const procurementAdds = Array.isArray((order as any).procurementStockAdds)
+      ? (order as any).procurementStockAdds
+      : [];
+    for (const add of procurementAdds) {
+      const qty = Number(add?.qty) || 0;
+      if (qty <= 0 || !add?.warehouseId) continue;
+      const rec = inMemoryProducts.find((p: any) => p.id === add.warehouseId);
+      if (!rec) continue;
+      rec.stockQuantity = Math.max(0, (Number(rec.stockQuantity) || 0) - qty);
+      if (mysqlPool && isMysqlConnected) {
+        try {
+          await mysqlPool.query(
+            'UPDATE products SET stock_quantity = GREATEST(0, stock_quantity - ?) WHERE id = ?',
+            [qty, rec.id]
+          );
+        } catch (dbErr: any) {
+          console.log('[MySQL Procurement Reversal Notice]:', dbErr.message);
+        }
+      }
+      console.log(
+        `[VeggieConnect Backend] Procurement #${order.id} cancelled: reversed ${qty}kg out of warehouse record ${rec.id}`
+      );
+    }
+    if (procurementAdds.length > 0) {
+      (order as any).procurementStockAdds = [];
+    }
+    // New-flow procurement orders are fully handled by the allocation restock
+    // plus the reversal above — the legacy warehouse-first loop below would
+    // put the same kilograms into the warehouse a SECOND time.
+    const procurementHandled = procurementAdds.length > 0;
+
     for (const item of items) {
+      if (procurementHandled) break;
       const prodId = item.produceId;
       const prodName = (item.produceName || '').trim().toLowerCase();
       const qty = Number(item.quantity) || 0;
       if (qty <= 0) continue;
 
-      // Only return stock that was actually taken off the shelf:
-      //  • Direct basket lots (real produce ids) were deducted at checkout →
-      //    always restock.
-      //  • REQUEST lots (placeholder "req-prod-*" ids) were deducted ONLY when
-      //    the order left 'pending' (fulfilled). Cancelling a still-pending
-      //    request must NOT restock — nothing was ever deducted, and doing so
-      //    would create phantom stock on the admin's Stocks menu.
-      const isRequestLot = isRequestLotItem(prodId);
+      // Only return stock that was actually taken off the shelf. Since v4.6
+      // NOTHING is deducted when a request is submitted — stock is taken only
+      // when the order first leaves 'pending' (fulfilled). Cancelling a
+      // still-pending request must NOT restock — neither request lots nor
+      // direct basket ids — because no kilo was ever deducted from any
+      // farmer or shelf.
       const wasFulfilled =
         (order as any).requestStockDeducted === true ||
         (previousStatus !== 'pending' && previousStatus !== 'cancelled');
-      if (isRequestLot && !wasFulfilled) continue;
+      if (!wasFulfilled) continue;
 
       // Restock in inMemoryProducts — exact id first (warehouse-owned), then
       // the highest-stock warehouse record matching the crop name. A farmer's
@@ -2580,6 +3087,409 @@ app.put('/api/orders/:id', async (req, res) => {
 });
 
 // 9. Transport Jobs: List, Create, and Update
+// ── DA Admin Console · password reset ────────────────────────────────────────
+// Simplest "forgot password" flow for the prototype (no email / SMS needed):
+// the admin sets a temporary password from the Users & KYC tab and hands it
+// to the user in person / over the phone. Works in both MySQL and memory mode.
+// ── Forgot-password: user request from the LOGIN page ────────────────────────
+// The user enters the mobile number or email on the account + the LAST
+// password they remember. The server checks that password against the
+// account's stored hash immediately: a wrong password is rejected here (so
+// the admin is never spammed with bogus requests), a correct one creates a
+// pending request that lights the account's PW button red in the Admin Console.
+app.post('/api/auth/request-password-reset', async (req, res) => {
+  try {
+    const { contact, lastPassword } = req.body || {};
+    if (typeof contact !== 'string' || !contact.trim() || typeof lastPassword !== 'string' || !lastPassword) {
+      return res
+        .status(400)
+        .json({ error: 'Enter the mobile number or email on your account AND the last password you remember.' });
+    }
+
+    const identifier = contact.trim().toLowerCase();
+    const normPhone = normalizePhone(contact.trim());
+    const user = inMemoryUsers.find(
+      (u) =>
+        (u.email && u.email.toLowerCase() === identifier) ||
+        (u.phone &&
+          (u.phone.replace(/\s+/g, '') === identifier.replace(/\s+/g, '') ||
+            (normPhone && normalizePhone(u.phone) === normPhone)))
+    );
+    if (!user) {
+      return res.status(404).json({ error: 'No account found with that mobile number or email.' });
+    }
+    if (!verifyPassword(lastPassword, user.password_hash)) {
+      return res
+        .status(400)
+        .json({ error: 'The last password you entered does not match our records. Please try again — or visit the DA office for help.' });
+    }
+
+    const now = new Date().toISOString();
+    const existing = inMemoryResetRequests.find((r) => r.userId === user.id && r.status === 'pending');
+    if (existing) {
+      existing.requestedAt = now;
+      existing.contact = contact.trim();
+      if (mysqlPool && isMysqlConnected) {
+        try {
+          await mysqlPool.query(`UPDATE password_reset_requests SET requested_at = ?, contact = ? WHERE id = ?`, [
+            now,
+            contact.trim(),
+            existing.id,
+          ]);
+        } catch (e) {}
+      }
+    } else {
+      const request = {
+        id: `pwr-${Date.now()}`,
+        userId: user.id,
+        userName: user.name,
+        userRole: user.role,
+        contact: contact.trim(),
+        status: 'pending',
+        requestedAt: now,
+      };
+      inMemoryResetRequests.unshift(request);
+      if (mysqlPool && isMysqlConnected) {
+        try {
+          await mysqlPool.query(
+            `INSERT INTO password_reset_requests (id, user_id, user_name, user_role, contact, status, requested_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [request.id, request.userId, request.userName, request.userRole, request.contact, 'pending', request.requestedAt]
+          );
+        } catch (dbErr) {
+          console.error('MySQL save reset request error:', dbErr);
+        }
+      }
+    }
+    console.log(`[VeggieConnect Auth] Password reset requested for ${user.name} (last password verified OK).`);
+    return res.json({
+      success: true,
+      message: `Request sent to the DA Admin. They verified your last password and will set a temporary password — collect it from the DA office, then log in with it.`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin inbox of forgot-password requests (Users & KYC tab PW-button badge).
+app.get('/api/password-reset-requests', (req, res) => {
+  res.json(inMemoryResetRequests);
+});
+
+// Admin dismisses a request WITHOUT resetting (e.g. they talked to the user
+// and it turned out unnecessary).
+app.delete('/api/password-reset-requests/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    inMemoryResetRequests = inMemoryResetRequests.filter((r) => r.id !== id);
+    if (mysqlPool && isMysqlConnected) {
+      try {
+        await mysqlPool.query(`DELETE FROM password_reset_requests WHERE id = ?`, [id]);
+      } catch (e) {}
+    }
+    return res.json({ success: true, message: 'Request dismissed.' });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/users/:id/reset-password', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newPassword } = req.body || {};
+    if (typeof newPassword !== 'string' || newPassword.trim().length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+    }
+    const target = inMemoryUsers.find((u) => u.id === id);
+    if (!target) return res.status(404).json({ error: 'User not found.' });
+
+    const newHash = hashPassword(newPassword.trim());
+    target.password_hash = newHash;
+
+    if (mysqlPool && isMysqlConnected) {
+      try {
+        await mysqlPool.query(`UPDATE users SET password_hash = ? WHERE id = ?`, [newHash, id]);
+      } catch (dbErr) {
+        console.error('MySQL reset password error:', dbErr);
+      }
+    }
+    console.log(`[VeggieConnect Admin] Password reset for ${target.name} (${target.role}).`);
+
+    // Setting the temporary password RESOLVES the account's pending
+    // forgot-password requests (the red PW badge clears immediately).
+    const resolvedAt = new Date().toISOString();
+    inMemoryResetRequests.forEach((r) => {
+      if (r.userId === id && r.status === 'pending') {
+        r.status = 'resolved';
+        r.resolvedAt = resolvedAt;
+        if (mysqlPool && isMysqlConnected) {
+          void mysqlPool
+            .query(`UPDATE password_reset_requests SET status = 'resolved', resolved_at = ? WHERE id = ?`, [resolvedAt, r.id])
+            .catch(() => {});
+        }
+      }
+    });
+    return res.json({
+      success: true,
+      message: `Temporary password set for ${target.name}. Share it with the user — they should change it at their next login opportunity.`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DA Admin Console · one-click demo dataset ────────────────────────────────
+// Fills the app with a realistic Negros Oriental scene so the first minute of
+// a demo/defense looks alive: 5 farmers, 5 buyers, 10 produce listings with
+// photos, and the two logistics riders (Transporter 1 & Transporter 2).
+// Idempotent: every record has a fixed seed-* id, so pressing the button
+// twice never duplicates data. All sample accounts use password 'veggie123'.
+function sampleVeggiePhoto(emoji: string, label: string, color1: string, color2: string): string {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="360" viewBox="0 0 480 360">` +
+    `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">` +
+    `<stop offset="0" stop-color="${color1}"/><stop offset="1" stop-color="${color2}"/>` +
+    `</linearGradient></defs>` +
+    `<rect width="480" height="360" fill="url(#g)"/>` +
+    `<circle cx="240" cy="150" r="88" fill="rgba(255,255,255,0.35)"/>` +
+    `<text x="240" y="182" font-size="100" text-anchor="middle">${emoji}</text>` +
+    `<text x="240" y="294" font-size="30" font-weight="bold" text-anchor="middle" fill="#ffffff" font-family="Arial, sans-serif">${label}</text>` +
+    `<text x="240" y="326" font-size="15" text-anchor="middle" fill="rgba(255,255,255,0.85)" font-family="Arial, sans-serif">VeggieConnect sample photo</text>` +
+    `</svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+function sampleAvatar(name: string, color: string): string {
+  const initials = name
+    .split(' ')
+    .map((w) => w[0])
+    .slice(0, 2)
+    .join('');
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120">` +
+    `<rect width="120" height="120" fill="${color}"/>` +
+    `<text x="60" y="74" font-size="42" font-weight="bold" text-anchor="middle" fill="#ffffff" font-family="Arial, sans-serif">${initials}</text>` +
+    `</svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+app.post('/api/admin/seed-sample-data', async (req, res) => {
+  try {
+    const nowIso = new Date().toISOString();
+    const seedPassword = hashPassword('veggie123');
+
+    // ── Sample people (password for ALL: veggie123) ────────────────────────
+    const seedUsers: any[] = [
+      // 4 approved farmers (ready to sell) + 1 pending (feeds the KYC queue)
+      {
+        id: 'seed-farmer-1', name: 'Lito Amahajan', email: 'lito.amahajan@sample.veggieconnect', phone: '0917 555 0101',
+        role: 'farmer', location: 'Bacong, Negros Oriental', latitude: 9.2628, longitude: 123.2906,
+        farmName: "Amahajan Vegetable Farm", avatar: sampleAvatar('Lito Amahajan', '#16a34a'),
+        status: 'active', verified: true, verificationStatus: 'Approved',
+        submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#15803d', '#166534'),
+        rsbsaNumber: '07-46-10-001-000101', walletBalance: 0, walletTransactions: [],
+      },
+      {
+        id: 'seed-farmer-2', name: 'Nena Villanueva', email: 'nena.villanueva@sample.veggieconnect', phone: '0917 555 0102',
+        role: 'farmer', location: 'Sibulan, Negros Oriental', latitude: 9.3611, longitude: 123.2883,
+        farmName: 'Villanueva Highlands Garden', avatar: sampleAvatar('Nena Villanueva', '#059669'),
+        status: 'active', verified: true, verificationStatus: 'Approved',
+        submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#15803d', '#166534'),
+        rsbsaNumber: '07-46-10-001-000102', walletBalance: 0, walletTransactions: [],
+      },
+      {
+        id: 'seed-farmer-3', name: 'Rickyboy dela Cruz', email: 'ricky.delacruz@sample.veggieconnect', phone: '0917 555 0103',
+        role: 'farmer', location: 'San Jose, Negros Oriental', latitude: 9.1572, longitude: 123.2642,
+        farmName: 'Dela Cruz Organic Farm', avatar: sampleAvatar('Rickyboy dela Cruz', '#0d9488'),
+        status: 'active', verified: true, verificationStatus: 'Approved',
+        submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#15803d', '#166534'),
+        rsbsaNumber: '07-46-10-001-000103', walletBalance: 0, walletTransactions: [],
+      },
+      {
+        id: 'seed-farmer-4', name: 'Marites Bantilan', email: 'marites.bantilan@sample.veggieconnect', phone: '0917 555 0104',
+        role: 'farmer', location: 'Valencia, Negros Oriental', latitude: 9.2717, longitude: 123.2514,
+        farmName: 'Bantilan Mountain Greens', avatar: sampleAvatar('Marites Bantilan', '#15803d'),
+        status: 'active', verified: true, verificationStatus: 'Approved',
+        submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#15803d', '#166534'),
+        rsbsaNumber: '07-46-10-001-000104', walletBalance: 0, walletTransactions: [],
+      },
+      {
+        id: 'seed-farmer-5', name: 'Pedro Sumalpong', email: 'pedro.sumalpong@sample.veggieconnect', phone: '0917 555 0105',
+        role: 'farmer', location: 'Amlan, Negros Oriental', latitude: 9.4586, longitude: 123.1667,
+        farmName: 'Sumalpong Family Farm', avatar: sampleAvatar('Pedro Sumalpong', '#65a30d'),
+        status: 'active', verified: false, verificationStatus: 'Pending',
+        submittedAt: nowIso,
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#15803d', '#166534'),
+        rsbsaNumber: '07-46-10-001-000105', walletBalance: 0, walletTransactions: [],
+      },
+      // 4 approved buyers (ready to order) + 1 pending
+      {
+        id: 'seed-buyer-1', name: 'Jocelyn Magsalay', email: 'jocelyn.magsalay@sample.veggieconnect', phone: '0918 555 0201',
+        role: 'buyer', location: 'Dumaguete City, Negros Oriental', latitude: 9.3068, longitude: 123.3054,
+        avatar: sampleAvatar('Jocelyn Magsalay', '#0284c7'), status: 'active', verified: true,
+        verificationStatus: 'Approved', submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#0369a1', '#1e40af'),
+        businessProofImage: sampleVeggiePhoto('🏪', 'Sample Business Permit', '#0284c7', '#1d4ed8'),
+        walletBalance: 1500, walletTransactions: [{ id: 'seed-tx-1', type: 'deposit', amount: 1500, balanceAfter: 1500, description: 'Initial wallet deposit (sample)', timestamp: nowIso }],
+      },
+      {
+        id: 'seed-buyer-2', name: 'Arnold Teves', email: 'arnold.teves@sample.veggieconnect', phone: '0918 555 0202',
+        role: 'buyer', location: 'Dumaguete City, Negros Oriental', latitude: 9.3125, longitude: 123.3099,
+        avatar: sampleAvatar('Arnold Teves', '#2563eb'), status: 'active', verified: true,
+        verificationStatus: 'Approved', submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#0369a1', '#1e40af'),
+        walletBalance: 1200, walletTransactions: [{ id: 'seed-tx-2', type: 'deposit', amount: 1200, balanceAfter: 1200, description: 'Initial wallet deposit (sample)', timestamp: nowIso }],
+      },
+      {
+        id: 'seed-buyer-3', name: 'Grace Hidalgo', email: 'grace.hidalgo@sample.veggieconnect', phone: '0918 555 0203',
+        role: 'buyer', location: 'Bais City, Negros Oriental', latitude: 9.5911, longitude: 123.1225,
+        avatar: sampleAvatar('Grace Hidalgo', '#0891b2'), status: 'active', verified: true,
+        verificationStatus: 'Approved', submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#0369a1', '#1e40af'),
+        businessProofImage: sampleVeggiePhoto('🏪', 'Sample Business Permit', '#0284c7', '#1d4ed8'),
+        walletBalance: 2000, walletTransactions: [{ id: 'seed-tx-3', type: 'deposit', amount: 2000, balanceAfter: 2000, description: 'Initial wallet deposit (sample)', timestamp: nowIso }],
+      },
+      {
+        id: 'seed-buyer-4', name: 'Danilo Dy', email: 'danilo.dy@sample.veggieconnect', phone: '0918 555 0204',
+        role: 'buyer', location: 'Tanjay City, Negros Oriental', latitude: 9.5161, longitude: 123.1592,
+        avatar: sampleAvatar('Danilo Dy', '#0e7490'), status: 'active', verified: true,
+        verificationStatus: 'Approved', submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#0369a1', '#1e40af'),
+        walletBalance: 900, walletTransactions: [{ id: 'seed-tx-4', type: 'deposit', amount: 900, balanceAfter: 900, description: 'Initial wallet deposit (sample)', timestamp: nowIso }],
+      },
+      {
+        id: 'seed-buyer-5', name: 'Karla Escobal', email: 'karla.escobal@sample.veggieconnect', phone: '0918 555 0205',
+        role: 'buyer', location: 'Dumaguete City, Negros Oriental', latitude: 9.3095, longitude: 123.3012,
+        avatar: sampleAvatar('Karla Escobal', '#38bdf8'), status: 'active', verified: false,
+        verificationStatus: 'Pending', submittedAt: nowIso,
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#0369a1', '#1e40af'),
+        businessProofImage: sampleVeggiePhoto('🏪', 'Sample Business Permit', '#0284c7', '#1d4ed8'),
+        walletBalance: 0, walletTransactions: [],
+      },
+      // The two logistics riders — busy until their current transaction completes
+      {
+        id: 'seed-transporter-1', name: 'Transporter 1', email: 'transporter.1@sample.veggieconnect', phone: '0919 555 0301',
+        role: 'transporter', location: 'Dumaguete City (Rizal Boulevard Area)', latitude: 9.3068, longitude: 123.3054,
+        avatar: sampleAvatar('Transporter 1', '#7c3aed'), status: 'active', verified: true,
+        verificationStatus: 'Approved', submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#6d28d9', '#4c1d95'),
+        vehicleType: 'Tricycle (Closed Van)', plateNumber: 'JVE-1101',
+        walletBalance: 500, walletTransactions: [],
+      },
+      {
+        id: 'seed-transporter-2', name: 'Transporter 2', email: 'transporter.2@sample.veggieconnect', phone: '0919 555 0302',
+        role: 'transporter', location: 'Dumaguete City (Bacong Area)', latitude: 9.2628, longitude: 123.2906,
+        avatar: sampleAvatar('Transporter 2', '#9333ea'), status: 'active', verified: true,
+        verificationStatus: 'Approved', submittedAt: nowIso, approvedAt: nowIso, approvedBy: 'DA Admin (sample data)',
+        validIdImage: sampleVeggiePhoto('🪪', 'Sample Valid ID', '#6d28d9', '#4c1d95'),
+        vehicleType: 'Motorcycle with Sidecar', plateNumber: 'KVG-2202',
+        walletBalance: 500, walletTransactions: [],
+      },
+    ];
+
+    // ── Sample produce (10 live listings with photos) ───────────────────────
+    const seedProducts: any[] = [
+      { id: 'seed-prod-1', farmerId: 'seed-farmer-1', farmerName: 'Lito Amahajan', farmName: 'Amahajan Vegetable Farm', name: 'Tomato (Roma)', category: 'Tomatoes & Peppers', variety: 'Roma / Pinoy', pricePerUnit: 85, unit: 'kg', stockQuantity: 40, minOrderQuantity: 1, harvestStatus: 'Harvested Today', harvestDate: 'Today, early morning', farmingMethod: 'Naturally Grown (Pesticide Free)', emoji: '🍅', color1: '#ef4444', color2: '#b91c1c', isOrganic: true, description: 'Firm Roma tomatoes perfect for ginisang dishes and salads. Picked fresh at dawn.', distanceKm: 7.2, rating: 4.9, reviewsCount: 12 },
+      { id: 'seed-prod-2', farmerId: 'seed-farmer-1', farmerName: 'Lito Amahajan', farmName: 'Amahajan Vegetable Farm', name: 'Eggplant (Talong)', category: 'Vegetables', variety: 'Long Purple', pricePerUnit: 70, unit: 'kg', stockQuantity: 25, minOrderQuantity: 1, harvestStatus: 'Harvested Today', harvestDate: 'Today, early morning', farmingMethod: 'Traditional Low-Spray', emoji: '🍆', color1: '#8b5cf6', color2: '#5b21b6', isOrganic: false, description: 'Glossy long purple eggplants — ideal for torta, ginisang talong and escabeche.', distanceKm: 7.2, rating: 4.7, reviewsCount: 8 },
+      { id: 'seed-prod-3', farmerId: 'seed-farmer-1', farmerName: 'Lito Amahajan', farmName: 'Amahajan Vegetable Farm', name: 'Sweet Potato (Camote)', category: 'Root Vegetables', variety: 'Native Camote', pricePerUnit: 40, unit: 'kg', stockQuantity: 50, minOrderQuantity: 2, harvestStatus: 'Curing / Farm Stored', harvestDate: 'Cured 3 days', farmingMethod: 'Certified Organic', emoji: '🍠', color1: '#f59e0b', color2: '#b45309', isOrganic: true, description: 'Sweet native camote — great boiled, fried as camote fries, or for nilupak.', distanceKm: 7.2, rating: 4.8, reviewsCount: 6 },
+      { id: 'seed-prod-4', farmerId: 'seed-farmer-2', farmerName: 'Nena Villanueva', farmName: 'Villanueva Highlands Garden', name: 'Sayote', category: 'Squash & Gourds', variety: 'Green Native', pricePerUnit: 45, unit: 'kg', stockQuantity: 60, minOrderQuantity: 2, harvestStatus: 'Harvested Today', harvestDate: 'Today, early morning', farmingMethod: 'Naturally Grown (Pesticide Free)', emoji: '🥬', color1: '#22c55e', color2: '#15803d', isOrganic: false, description: 'Crisp highland sayote for tinola, chopsuey and guisado. Sold by the kilo.', distanceKm: 10.5, rating: 4.9, reviewsCount: 10 },
+      { id: 'seed-prod-5', farmerId: 'seed-farmer-2', farmerName: 'Nena Villanueva', farmName: 'Villanueva Highlands Garden', name: 'Kangkong', category: 'Leafy Greens', variety: 'Native Upo-Style', pricePerUnit: 25, unit: 'bundle', stockQuantity: 80, minOrderQuantity: 3, harvestStatus: 'Fresh Picked on Order', harvestDate: 'Picked the same day you order', farmingMethod: 'Naturally Grown (Pesticide Free)', emoji: '🌿', color1: '#10b981', color2: '#047857', isOrganic: true, description: 'Fresh water spinach bundles — adobong kangkong, sinigang orok or atchara-ready.', distanceKm: 10.5, rating: 4.6, reviewsCount: 14 },
+      { id: 'seed-prod-6', farmerId: 'seed-farmer-2', farmerName: 'Nena Villanueva', farmName: 'Villanueva Highlands Garden', name: 'Spring Onion (Sibuyas Dahon)', category: 'Herbs & Microgreens', variety: 'Native', pricePerUnit: 60, unit: 'bundle', stockQuantity: 35, minOrderQuantity: 2, harvestStatus: 'Harvested Today', harvestDate: 'Today, early morning', farmingMethod: 'Traditional Low-Spray', emoji: '🌱', color1: '#84cc16', color2: '#4d7c0f', isOrganic: false, description: 'Aromatic spring onion bundles — the finishing touch for every Filipino dish.', distanceKm: 10.5, rating: 4.8, reviewsCount: 9 },
+      { id: 'seed-prod-7', farmerId: 'seed-farmer-3', farmerName: 'Rickyboy dela Cruz', farmName: 'Dela Cruz Organic Farm', name: 'Cabbage (Repolyo)', category: 'Leafy Greens', variety: 'Scorpio F1', pricePerUnit: 90, unit: 'kg', stockQuantity: 30, minOrderQuantity: 1, harvestStatus: 'Harvesting Tomorrow AM', harvestDate: 'Tomorrow, 5 AM', farmingMethod: 'GAP Certified (Good Agricultural Practices)', emoji: '🥬', color1: '#34d399', color2: '#059669', isOrganic: false, description: 'Tight, heavy heads of cabbage — ukoy-utan, nilaga and chopsuey staple.', distanceKm: 16.8, rating: 4.7, reviewsCount: 7 },
+      { id: 'seed-prod-8', farmerId: 'seed-farmer-3', farmerName: 'Rickyboy dela Cruz', farmName: 'Dela Cruz Organic Farm', name: 'Carrots', category: 'Root Vegetables', variety: 'Kuroda', pricePerUnit: 110, unit: 'kg', stockQuantity: 20, minOrderQuantity: 1, harvestStatus: 'Harvested Today', harvestDate: 'Today, early morning', farmingMethod: 'GAP Certified (Good Agricultural Practices)', emoji: '🥕', color1: '#fb923c', color2: '#c2410c', isOrganic: false, description: 'Sweet, crunchy highland carrots for caldereta, menudo and fresh juices.', distanceKm: 16.8, rating: 4.8, reviewsCount: 11 },
+      { id: 'seed-prod-9', farmerId: 'seed-farmer-4', farmerName: 'Marites Bantilan', farmName: 'Bantilan Mountain Greens', name: 'Squash (Kalabasa)', category: 'Squash & Gourds', variety: 'SQ Hybrid', pricePerUnit: 50, unit: 'kg', stockQuantity: 45, minOrderQuantity: 2, harvestStatus: 'Curing / Farm Stored', harvestDate: 'Cured 2 days', farmingMethod: 'Naturally Grown (Pesticide Free)', emoji: '🎃', color1: '#f97316', color2: '#9a3412', isOrganic: false, description: 'Sweet-fleshed kalabasa for bulanglang, ginataang kalabasa and lumpia.', distanceKm: 12.4, rating: 4.9, reviewsCount: 15 },
+      { id: 'seed-prod-10', farmerId: 'seed-farmer-4', farmerName: 'Marites Bantilan', farmName: 'Bantilan Mountain Greens', name: 'Ampalaya (Bitter Gourd)', category: 'Legumes & Pods', variety: 'Native Ampalaya', pricePerUnit: 95, unit: 'kg', stockQuantity: 18, minOrderQuantity: 1, harvestStatus: 'Harvested Today', harvestDate: 'Today, early morning', farmingMethod: 'Certified Organic', emoji: '🥒', color1: '#65a30d', color2: '#3f6212', isOrganic: true, description: 'Organic ampalaya, less bitter variety — ampalaya con carne or ensalada.', distanceKm: 12.4, rating: 4.6, reviewsCount: 5 },
+    ];
+
+    let usersCreated = 0;
+    let productsCreated = 0;
+
+    for (const su of seedUsers) {
+      if (inMemoryUsers.some((u) => u.id === su.id)) continue; // idempotent
+      const record: any = {
+        bio: '',
+        password_hash: seedPassword,
+        ...su,
+        walletBalance: su.walletBalance || 0,
+        walletTransactions: su.walletTransactions || [],
+      };
+      inMemoryUsers.push(record);
+      usersCreated++;
+      if (mysqlPool && isMysqlConnected) {
+        try {
+          await mysqlPool.query(
+            `INSERT INTO users (id, name, email, password_hash, phone, role, location, farm_name, avatar_url, status, is_verified, verification_status, valid_id_image, rsbsa_number, business_proof_image, submitted_at, approved_at, approved_by, wallet_balance, wallet_transactions)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              record.id, record.name, record.email, seedPassword, record.phone, record.role, record.location,
+              record.farmName || null, record.avatar, record.status, record.verified ? 1 : 0,
+              record.verificationStatus, record.validIdImage || null, record.rsbsaNumber || null,
+              record.businessProofImage || null, record.submittedAt, record.approvedAt || null,
+              record.approvedBy || null, record.walletBalance || 0, JSON.stringify(record.walletTransactions || []),
+            ]
+          );
+        } catch (dbErr) {
+          console.error(`[VeggieConnect Seed] MySQL insert user ${record.id} error:`, dbErr);
+        }
+      }
+    }
+
+    for (const sp of seedProducts) {
+      if (inMemoryProducts.some((p) => p.id === sp.id)) continue; // idempotent
+      const item: any = {
+        id: sp.id, farmerId: sp.farmerId, farmerName: sp.farmerName, farmName: sp.farmName,
+        name: sp.name, category: sp.category, variety: sp.variety, pricePerUnit: sp.pricePerUnit,
+        unit: sp.unit, stockQuantity: sp.stockQuantity, minOrderQuantity: sp.minOrderQuantity,
+        harvestStatus: sp.harvestStatus, harvestDate: sp.harvestDate, farmingMethod: sp.farmingMethod,
+        imageUrl: sampleVeggiePhoto(sp.emoji, sp.name, sp.color1, sp.color2), isOrganic: sp.isOrganic,
+        description: sp.description, location: inMemoryUsers.find((u) => u.id === sp.farmerId)?.location || 'Negros Oriental',
+        latitude: inMemoryUsers.find((u) => u.id === sp.farmerId)?.latitude,
+        longitude: inMemoryUsers.find((u) => u.id === sp.farmerId)?.longitude,
+        distanceKm: sp.distanceKm, rating: sp.rating, reviewsCount: sp.reviewsCount,
+      };
+      inMemoryProducts.unshift(item);
+      productsCreated++;
+      if (mysqlPool && isMysqlConnected) {
+        try {
+          await mysqlPool.query(
+            `INSERT INTO products (id, farmer_id, farmer_name, farm_name, name, category, variety, price_per_unit, unit, stock_quantity, min_order_quantity, harvest_status, harvest_date, farming_method, image_url, is_organic, description, location, latitude, longitude, distance_km, rating, reviews_count)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+              item.id, item.farmerId, item.farmerName, item.farmName, item.name, item.category,
+              item.variety || null, item.pricePerUnit, item.unit, item.stockQuantity, item.minOrderQuantity || 1,
+              item.harvestStatus, item.harvestDate, item.farmingMethod || 'Traditional Low-Spray',
+              item.imageUrl, item.isOrganic ? 1 : 0, item.description, item.location,
+              item.latitude ?? null, item.longitude ?? null, item.distanceKm || 5, item.rating || 5,
+              item.reviewsCount || 0,
+            ]
+          );
+        } catch (dbErr) {
+          console.error(`[VeggieConnect Seed] MySQL insert product ${item.id} error:`, dbErr);
+        }
+      }
+    }
+
+    console.log(
+      `[VeggieConnect Seed] Sample data loaded: ${usersCreated} users, ${productsCreated} produce items ` +
+      `(transporters: Transporter 1 & Transporter 2 — busy until their transaction completes).`
+    );
+    return res.json({
+      success: true,
+      created: { users: usersCreated, products: productsCreated },
+      message:
+        usersCreated === 0 && productsCreated === 0
+          ? 'Sample data is already loaded — nothing new was added.'
+          : `Loaded ${usersCreated} sample accounts and ${productsCreated} produce listings. All sample passwords: veggie123 (Farmers: Lito, Nena, Rickyboy, Marites · Buyers: Jocelyn, Arnold, Grace, Danilo · Transporter 1 / Transporter 2). One pending farmer (Pedro) and one pending buyer (Karla) were added to the verification queue for the KYC demo.`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/transport-jobs', (req, res) => {
   // Ensure consistency: if linked order is cancelled, the job is cancelled
   inMemoryTransportJobs.forEach((job) => {
@@ -2624,6 +3534,25 @@ app.put('/api/transport-jobs/:id', async (req, res) => {
 
   const job = inMemoryTransportJobs.find((j) => j.id === id);
   if (!job) return res.status(404).json({ error: 'Transport job not found' });
+
+  // ── One active haul per transporter ──────────────────────────────────────
+  // A transporter stays BUSY from accepting a haul until that transaction is
+  // completed (or cancelled). While busy they cannot accept another one —
+  // this is what keeps "Transporter 1" realistic in the demo.
+  if (status === 'accepted' && assignedTransporterId) {
+    const busyJob = inMemoryTransportJobs.find(
+      (j) =>
+        j.id !== id &&
+        j.assignedTransporterId === assignedTransporterId &&
+        (j.status === 'accepted' || j.status === 'picked_up' || j.status === 'in_transit')
+    );
+    if (busyJob) {
+      return res.status(409).json({
+        code: 'TRANSPORTER_BUSY',
+        error: `${assignedTransporterName || 'This transporter'} is still delivering order #${busyJob.orderId}. They become available again once that transaction is completed.`,
+      });
+    }
+  }
 
   if (status) job.status = status;
   if (assignedTransporterId) job.assignedTransporterId = assignedTransporterId;
@@ -2680,7 +3609,7 @@ app.put('/api/transport-jobs/:id', async (req, res) => {
       FULFILLMENT_STATUSES.includes(matchedOrder.status) &&
       (previousOrderStatus === 'pending' || previousOrderStatus === undefined)
     ) {
-      const sourcing = deductRequestLotsForOrder(matchedOrder);
+      const sourcing = await fulfillOrderStock(matchedOrder);
       if (sourcing.blocked) {
         matchedOrder.status = previousOrderStatus;
         (matchedOrder as any).pendingQuote = sourcing.quote;

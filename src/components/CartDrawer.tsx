@@ -19,6 +19,7 @@ import {
 import { CartItem, Order, OrderItem, UserProfile } from '../types';
 import { farmerUnitPrice, buyerUnitPrice } from '../utils/pricing';
 import { MIN_ORDER_KG, MIN_PRODUCT_KG } from './ProduceCard';
+import { BULK_DISCOUNT_MIN_KG, computeBulkDiscount } from '../utils/bulkDiscount';
 
 interface CartDrawerProps {
   cart: CartItem[];
@@ -75,7 +76,13 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
     return sum + unitPrice * item.quantity;
   }, 0);
 
-  const totalAmount = subtotal;
+  // Order-level bulk discount: 90 kg or more in ONE order (any mix of
+  // products) earns ₱100 off the direct payment. The server re-checks this
+  // and remains the source of truth.
+  const bulkDiscount = computeBulkDiscount(
+    cart.map((item) => ({ quantity: item.quantity, unit: item.produce?.unit }))
+  );
+  const totalAmount = Math.max(0, Math.round((subtotal - bulkDiscount) * 100) / 100);
 
   // Total kg across ALL products in the cart — the 60 kg minimum applies to
   // this SUM, so buying more than one product works as long as the combined
@@ -182,6 +189,7 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
       subtotal,
       deliveryFee: 0,
       totalAmount,
+      bulkDiscount,
       farmgateCostTotal,
       adminCommissionTotal,
       status: 'pending', // Buyer Request Submitted, waiting for Admin Processing
@@ -460,6 +468,19 @@ export const CartDrawer: React.FC<CartDrawerProps> = ({
               <span>Produce Subtotal</span>
               <span className="text-emerald-950 font-bold">₱{subtotal.toFixed(2)}</span>
             </div>
+            {bulkDiscount > 0 ? (
+              <div className="flex justify-between text-emerald-700">
+                <span className="font-bold">Bulk Discount (90 kg+)</span>
+                <span className="font-black">−₱{bulkDiscount.toFixed(2)}</span>
+              </div>
+            ) : (
+              <div className="flex justify-between text-neutral-500">
+                <span>Bulk Discount (90 kg+)</span>
+                <span>
+                  add {Math.ceil(BULK_DISCOUNT_MIN_KG - totalCartKg)} kg more for −₱100
+                </span>
+              </div>
+            )}
             <div className="border-t border-emerald-100 pt-2 flex justify-between text-sm font-black text-emerald-950">
               <span>Total Direct Payment</span>
               <span className="text-emerald-700 font-black">₱{totalAmount.toFixed(2)}</span>

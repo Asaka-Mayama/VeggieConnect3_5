@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root { --text: #111827; --text-sub: #6B7280; --border: #E5E7EB; --connector: #64748B; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #FFFFFF; color: var(--text); -webkit-font-smoothing: antialiased;
+  }
+  #root { width: fit-content; min-width: 1280px; margin: 0 auto; padding: 44px 40px; background: #FFFFFF; }
+  .flow-title { font-size: 22px; font-weight: 700; text-align: center; }
+  .flow-subtitle { font-size: 13px; color: var(--text-sub); text-align: center; margin-top: 8px; margin-bottom: 34px; }
+
+  .erd-grid {
+    position: relative;
+    display: grid; grid-template-columns: repeat(3, 360px);
+    gap: 64px 90px; justify-content: center;
+  }
+  .tbl { background: #FFFFFF; border: 1.5px solid #94A3B8; border-radius: 10px; overflow: hidden;
+         box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+  .tbl .tbl-head { background: #E8EDF2; padding: 10px 14px; font-size: 15px; font-weight: 700; color: #1E3050;
+                   border-bottom: 1.5px solid #94A3B8; }
+  .tbl .tbl-head .rowcount { font-size: 11px; font-weight: 500; color: #64748B; float: right; margin-top: 3px; }
+  .col-row { display: flex; justify-content: space-between; padding: 5px 14px; font-size: 12.5px;
+             border-bottom: 1px solid #F1F5F9; background: #FFFFFF; }
+  .col-row .cname { color: #374151; font-weight: 500; }
+  .col-row .ctype { color: #9CA3AF; font-size: 11px; margin-left: 12px; white-space: nowrap; }
+  .col-row.pk { background: #F8FAFC; }
+  .col-row.pk .cname { font-weight: 700; color: #1E3050; }
+  .col-row.fk { background: #F0F4F8; }
+  .col-row.fk .cname { color: #1E3A5F; font-weight: 600; }
+  .col-row.fk .fk-badge { font-size: 10px; font-weight: 700; color: #FFFFFF; background: #5B7A99;
+                          border-radius: 3px; padding: 0 5px; margin-left: 6px; vertical-align: 1px; }
+  .col-row .uq-badge { font-size: 10px; font-weight: 700; color: #64748B; border: 1px solid #94A3B8;
+                       border-radius: 3px; padding: 0 4px; margin-left: 6px; }
+  .col-row.more { color: #9CA3AF; font-size: 11.5px; background: #F8FAFC; }
+  .tbl.ref { border-style: dashed; }
+  .tbl.ref .tbl-head { background: #F1F5F9; color: #475569; border-bottom-style: dashed; }
+  .ref-note { font-size: 11.5px; color: #6B7280; padding: 8px 14px 10px; line-height: 1.45; }
+
+  .flow-connectors { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 0; }
+  .flow-connectors path { stroke: var(--connector); stroke-width: 2; fill: none; }
+  .flow-connectors path.dashed { stroke-dasharray: 6 4; }
+  .connector-label { font-size: 11.5px; fill: #475569; text-anchor: middle; font-weight: 600;
+    font-family: -apple-system, 'Segoe UI', sans-serif; }
+
+  .legend { display: flex; gap: 24px; justify-content: center; margin-top: 30px; padding: 14px 24px;
+    background: #F9FAFB; border-radius: 8px; border: 1px solid #E5E7EB; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #4B5563; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 3px; border: 2px solid; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div class="flow-title">VeggieConnect — Entity-Relationship Diagram</div>
+  <div class="flow-subtitle">Six MySQL tables, auto-provisioned by server.ts on startup (missing columns are added by in-place migrations)</div>
+
+  <div class="erd-grid" id="erdGrid" style="position:relative;">
+    <svg class="flow-connectors" id="erdSvg"></svg>
+
+    <!-- Column 1, row 1: products -->
+    <div class="tbl" id="t-products">
+      <div class="tbl-head">products <span class="rowcount">produce listings</span></div>
+      <div class="col-row pk" id="r-products-id"><span class="cname">id</span><span class="ctype">VARCHAR(64) · PK</span></div>
+      <div class="col-row fk" id="r-products-farmer"><span class="cname">farmer_id<span class="fk-badge">FK</span></span><span class="ctype">VARCHAR(64)</span></div>
+      <div class="col-row"><span class="cname">farmer_name · farm_name</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">name · category · variety</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">price_per_unit · unit</span><span class="ctype">DECIMAL / VARCHAR</span></div>
+      <div class="col-row"><span class="cname">stock_quantity</span><span class="ctype">INT</span></div>
+      <div class="col-row"><span class="cname">min_order_quantity</span><span class="ctype">INT (20 kg rule)</span></div>
+      <div class="col-row"><span class="cname">harvest_status · farming_method</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">location · latitude / longitude</span><span class="ctype">VARCHAR / DOUBLE</span></div>
+      <div class="col-row more">+ 12 more (broker_status, farmgate_asking_price, bought_*, sourcing_region …)</div>
+    </div>
+
+    <!-- Column 2, row 1: users -->
+    <div class="tbl" id="t-users">
+      <div class="tbl-head">users <span class="rowcount">accounts</span></div>
+      <div class="col-row pk" id="r-users-id"><span class="cname">id</span><span class="ctype">VARCHAR(64) · PK</span></div>
+      <div class="col-row"><span class="cname">name</span><span class="ctype">VARCHAR(120)</span></div>
+      <div class="col-row"><span class="cname">email<span class="uq-badge">UQ</span></span><span class="ctype">VARCHAR(120)</span></div>
+      <div class="col-row"><span class="cname">password_hash</span><span class="ctype">VARCHAR(255)</span></div>
+      <div class="col-row"><span class="cname">phone</span><span class="ctype">VARCHAR(50)</span></div>
+      <div class="col-row"><span class="cname">role</span><span class="ctype">ENUM(farmer, buyer, admin)</span></div>
+      <div class="col-row"><span class="cname">farm_name · location</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">latitude / longitude</span><span class="ctype">DOUBLE (added)</span></div>
+      <div class="col-row"><span class="cname">status · is_verified · verification_status</span><span class="ctype">ENUM / TINYINT / VARCHAR</span></div>
+      <div class="col-row"><span class="cname">wallet_balance · wallet_transactions</span><span class="ctype">DECIMAL / LONGTEXT</span></div>
+      <div class="col-row more">+ 4 more (valid_id_image, rsbsa_number, business_proof_image, submitted_at)</div>
+    </div>
+
+    <!-- Column 3, row 1: orders -->
+    <div class="tbl" id="t-orders">
+      <div class="tbl-head">orders <span class="rowcount">buyer orders</span></div>
+      <div class="col-row pk" id="r-orders-id"><span class="cname">id</span><span class="ctype">VARCHAR(64) · PK</span></div>
+      <div class="col-row fk" id="r-orders-buyer"><span class="cname">buyer_id<span class="fk-badge">FK</span></span><span class="ctype">VARCHAR(64)</span></div>
+      <div class="col-row fk" id="r-orders-farmer"><span class="cname">farmer_id<span class="fk-badge">FK</span></span><span class="ctype">VARCHAR(64)</span></div>
+      <div class="col-row"><span class="cname">buyer_name · buyer_phone</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">farm_name</span><span class="ctype">VARCHAR(150)</span></div>
+      <div class="col-row"><span class="cname">subtotal · delivery_fee · total_amount</span><span class="ctype">DECIMAL(10,2)</span></div>
+      <div class="col-row"><span class="cname">payment_method</span><span class="ctype">VARCHAR (wallet-paid gate)</span></div>
+      <div class="col-row"><span class="cname">delivery_address · pickup_slot · notes</span><span class="ctype">TEXT / VARCHAR</span></div>
+      <div class="col-row"><span class="cname">transporter_id · vehicle_type</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row more">+ status / paid state tracked app-side per build v3.4</div>
+    </div>
+
+    <!-- Column 1, row 2: direct_messages -->
+    <div class="tbl" id="t-messages">
+      <div class="tbl-head">direct_messages <span class="rowcount">chat</span></div>
+      <div class="col-row pk" id="r-messages-id"><span class="cname">id</span><span class="ctype">VARCHAR(64) · PK</span></div>
+      <div class="col-row fk" id="r-messages-sender"><span class="cname">sender_id<span class="fk-badge">FK</span></span><span class="ctype">VARCHAR(64)</span></div>
+      <div class="col-row"><span class="cname">sender_name · sender_role</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row fk" id="r-messages-recipient"><span class="cname">recipient_id<span class="fk-badge">FK</span></span><span class="ctype">VARCHAR(64)</span></div>
+      <div class="col-row"><span class="cname">recipient_name · recipient_role</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">text</span><span class="ctype">TEXT</span></div>
+      <div class="col-row"><span class="cname">produce_name · order_id</span><span class="ctype">VARCHAR (optional links)</span></div>
+      <div class="col-row"><span class="cname">created_at</span><span class="ctype">TIMESTAMP</span></div>
+    </div>
+
+    <!-- Column 2, row 2: da_price_bulletin (reference) -->
+    <div class="tbl ref" id="t-prices">
+      <div class="tbl-head">da_price_bulletin <span class="rowcount">reference data</span></div>
+      <div class="col-row pk"><span class="cname">id</span><span class="ctype">VARCHAR(64) · PK</span></div>
+      <div class="col-row"><span class="cname">commodity · local_name · variety</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">category · unit</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">prevailing_retail_price</span><span class="ctype">DECIMAL(10,2)</span></div>
+      <div class="col-row"><span class="cname">prevailing_farmgate_price</span><span class="ctype">DECIMAL(10,2)</span></div>
+      <div class="col-row"><span class="cname">price_range_min / max · trend · change_amount</span><span class="ctype">DECIMAL / ENUM</span></div>
+      <div class="col-row"><span class="cname">market_center · updated_date</span><span class="ctype">VARCHAR</span></div>
+      <div class="ref-note">Standalone price bulletin (seeded via veggie_connect3.sql / DA Price Watch) — no foreign keys.</div>
+    </div>
+
+    <!-- Column 3, row 2: transport_jobs -->
+    <div class="tbl" id="t-jobs">
+      <div class="tbl-head">transport_jobs <span class="rowcount">deliveries</span></div>
+      <div class="col-row pk" id="r-jobs-id"><span class="cname">id</span><span class="ctype">VARCHAR(64) · PK</span></div>
+      <div class="col-row fk" id="r-jobs-order"><span class="cname">order_id<span class="fk-badge">FK</span></span><span class="ctype">VARCHAR(64)</span></div>
+      <div class="col-row"><span class="cname">pickup_farm · pickup_location</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">dropoff_location</span><span class="ctype">VARCHAR(200)</span></div>
+      <div class="col-row"><span class="cname">buyer_name · buyer_phone</span><span class="ctype">VARCHAR</span></div>
+      <div class="col-row"><span class="cname">items_summary</span><span class="ctype">TEXT</span></div>
+      <div class="col-row"><span class="cname">weight_kg_est</span><span class="ctype">DECIMAL(6,2)</span></div>
+      <div class="col-row"><span class="cname">earnings_peso</span><span class="ctype">DECIMAL(10,2)</span></div>
+      <div class="col-row"><span class="cname">assigned_transporter_id / name</span><span class="ctype">VARCHAR</span></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="border-color:#94A3B8;background:#FFFFFF;"></div>Table</div>
+    <div class="legend-item"><div class="legend-dot" style="border-color:#5B7A99;background:#F0F4F8;"></div>FK column</div>
+    <div class="legend-item"><div class="legend-dot" style="border-color:#94A3B8;background:#F8FAFC;border-style:dashed;"></div>Reference table (no FK)</div>
+    <div class="legend-item" style="color:#475569;font-weight:600;">N : 1 &nbsp;=&nbsp; many rows reference one parent</div>
+  </div>
+</div>
+
+<script>
+  function draw() {
+    const svg = document.getElementById('erdSvg');
+    const grid = document.getElementById('erdGrid');
+    const g = grid.getBoundingClientRect();
+    svg.setAttribute('width', g.width); svg.setAttribute('height', g.height);
+    svg.setAttribute('viewBox', `0 0 ${g.width} ${g.height}`);
+    svg.innerHTML = '<defs><marker id="ah" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#64748B"/></marker></defs>';
+
+    const rowRect = id => { const el = document.getElementById(id); const r = el.getBoundingClientRect();
+      return { left: r.left - g.left, right: r.right - g.left, top: r.top - g.top, bottom: r.bottom - g.top,
+               cx: r.left - g.left + r.width / 2, cy: r.top - g.top + r.height / 2 }; };
+    const P = (d, dashed, label, lx, ly) => {
+      const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      p.setAttribute('d', d); if (dashed) p.setAttribute('class', 'dashed');
+      p.setAttribute('marker-end', 'url(#ah)'); svg.appendChild(p);
+      if (label) { const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        t.setAttribute('x', lx); t.setAttribute('y', ly); t.setAttribute('class', 'connector-label');
+        t.textContent = label; svg.appendChild(t); }
+    };
+
+    // products.farmer_id → users.id (horizontal, same band)
+    const pf = rowRect('r-products-farmer'), ui = rowRect('r-users-id');
+    P(`M ${pf.right} ${pf.cy} L ${ui.left} ${ui.cy}`, false, 'N : 1 farmer', (pf.right + ui.left) / 2, pf.cy - 7);
+
+    // orders.buyer_id / farmer_id → users.id (two offset horizontals)
+    const ob = rowRect('r-orders-buyer'), of = rowRect('r-orders-farmer');
+    P(`M ${ob.left} ${ob.cy} L ${ui.right} ${ui.cy - 5}`, false, 'N : 1 buyer', (ob.left + ui.right) / 2, ob.cy - 7);
+    P(`M ${of.left} ${of.cy} L ${ui.right} ${ui.cy + 5}`, false, '', 0, 0);
+
+    // transport_jobs.order_id → orders (vertical, same column — targets the card
+    // bottom edge so the connector never crosses the orders card interior)
+    const jo = rowRect('r-jobs-order');
+    const to = document.getElementById('t-orders').getBoundingClientRect();
+    const ordersBottom = to.bottom - g.top, ordersCx = to.left - g.left + to.width / 2;
+    const gapY = (ordersBottom + jo.top) / 2;
+    P(`M ${jo.cx} ${jo.top} L ${ordersCx} ${ordersBottom}`, false, 'N : 1 order', ordersCx + 42, gapY + 4);
+
+    // direct_messages.sender_id / recipient_id → users (orthogonal up into users bottom edge)
+    const tu = document.getElementById('t-users').getBoundingClientRect();
+    const usersBottom = tu.bottom - g.top, usersLeft = tu.left - g.left;
+    const ms = rowRect('r-messages-sender'), mr = rowRect('r-messages-recipient');
+    const midX1 = usersLeft - 36, midX2 = usersLeft - 56;
+    P(`M ${ms.right} ${ms.cy} L ${midX1} ${ms.cy} L ${midX1} ${usersBottom} L ${usersLeft + 46} ${usersBottom}`);
+    P(`M ${mr.right} ${mr.cy} L ${midX2} ${mr.cy} L ${midX2} ${usersBottom} L ${usersLeft + 100} ${usersBottom}`);
+    // Labels sit in the empty band just below the users card, right-anchored left of the lines
+    const lbl = (x, y, text) => { const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      t.setAttribute('x', x); t.setAttribute('y', y); t.setAttribute('class', 'connector-label');
+      t.setAttribute('text-anchor', 'end'); t.textContent = text; svg.appendChild(t); };
+    lbl(usersLeft - 64, usersBottom + 22, 'N : 1 sender');
+    lbl(usersLeft - 64, usersBottom + 42, 'N : 1 recipient');
+  }
+  window.addEventListener('load', () => setTimeout(draw, 120));
+</script>
+</body>
+</html>

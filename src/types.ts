@@ -37,6 +37,11 @@ export interface UserProfile {
   rsbsaNumber?: string;
   /** Buyer only, OPTIONAL — Barangay Clearance / DTI / Business Permit photo. */
   businessProofImage?: string;
+  /** Verification audit trail — set when the DA Admin approves / rejects. */
+  approvedAt?: string;
+  approvedBy?: string;
+  rejectedAt?: string;
+  rejectedBy?: string;
 }
 
 export type WalletTransactionType = 'deposit' | 'payment' | 'refund';
@@ -198,6 +203,11 @@ export interface OrderItem {
   /** Amount returned / not charged for this line when unavailable. */
   refundedAmount?: number;
   refundedAt?: string;
+  /** Partial fulfillment (v4.11): the quantity originally requested before
+   *  the admin fulfilled with less stock than the buyer asked for. */
+  originalQuantity?: number;
+  /** Partial fulfillment: kilograms of this line that could not be sourced. */
+  shortfallKg?: number;
 }
 
 export type OrderStatus =
@@ -231,6 +241,8 @@ export interface Order {
   subtotal: number;
   deliveryFee: number;
   totalAmount: number;
+  /** ₱100 order-level bulk discount (order ≥ 90 kg) — already deducted from totalAmount. */
+  bulkDiscount?: number;
   paymentMethod: string;
   status: OrderStatus;
   transportJobId?: string;
@@ -262,6 +274,11 @@ export interface Order {
   refundedTotal?: number;
   /** Portion of the payment already credited back to the buyer's wallet. */
   refundedCredited?: number;
+  /** Partial fulfillment (v4.11): the admin fulfilled with only the available
+   *  stock — the buyer is charged for the delivered products only, and the
+   *  shortfall amount is recorded as a refund (refundedTotal). */
+  partialFulfilled?: boolean;
+  partialFulfilledAt?: string;
   createdAt?: string;
   transporterId?: string;
   transporterName?: string;

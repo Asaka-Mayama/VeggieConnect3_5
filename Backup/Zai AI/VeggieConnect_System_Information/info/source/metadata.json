@@ -1,0 +1,8 @@
+{
+  "name": "VeggieConnect3.2 Nov 8 - Buyer Requests pills + Live Map lock",
+  "description": "Direct vegetable market mobile application connecting farmers and buyers with live chat, farm-gate orders, and administrative user management.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

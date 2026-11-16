@@ -3,6 +3,7 @@ import { ClipboardList, X, Plus, Trash2, Info, ShoppingBasket, Sprout } from 'lu
 import { Order, OrderItem, ProduceItem, UserProfile } from '../types';
 import { buyerUnitPrice, farmerUnitPrice } from '../utils/pricing';
 import { MIN_PRODUCT_KG, MIN_ORDER_KG } from './ProduceCard';
+import { BULK_DISCOUNT_MIN_KG, computeBulkDiscount } from '../utils/bulkDiscount';
 
 interface RequestCropsModalProps {
   isOpen: boolean;
@@ -106,7 +107,12 @@ export const RequestCropsModal: React.FC<RequestCropsModalProps> = ({
   const totalKg = lines.reduce((s, l) => s + (Number(l.quantity) || 0), 0);
   const subtotal = Math.round(lines.reduce((s, l) => s + lineTotal(l), 0) * 100) / 100;
   const deliveryFee = 0;
-  const totalAmount = Math.round((subtotal + deliveryFee) * 100) / 100;
+  // Order-level bulk discount: a request of 90 kg or more (any mix of crops)
+  // earns ₱100 off. The server re-checks this and remains the source of truth.
+  const bulkDiscount = computeBulkDiscount(
+    lines.map((l) => ({ quantity: l.quantity, unit: produceById(l.produceId)?.unit }))
+  );
+  const totalAmount = Math.round(Math.max(0, subtotal + deliveryFee - bulkDiscount) * 100) / 100;
   const farmgateCostTotal =
     Math.round(
       lines.reduce((s, l) => {
@@ -192,6 +198,7 @@ export const RequestCropsModal: React.FC<RequestCropsModalProps> = ({
       subtotal,
       deliveryFee,
       totalAmount,
+      bulkDiscount,
       farmgateCostTotal,
       adminCommissionTotal,
       status: 'pending',
@@ -339,6 +346,17 @@ export const RequestCropsModal: React.FC<RequestCropsModalProps> = ({
                 {totalKg} kg / min {MIN_ORDER_KG} kg
               </span>
             </div>
+            {bulkDiscount > 0 ? (
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-bold text-emerald-700">Bulk Discount (90 kg+)</span>
+                <span className="font-black text-emerald-700">−₱{bulkDiscount.toFixed(2)}</span>
+              </div>
+            ) : (
+              <div className="flex items-center justify-between text-[10px] text-neutral-500">
+                <span>Bulk Discount (90 kg+)</span>
+                <span>add {Math.ceil(BULK_DISCOUNT_MIN_KG - totalKg)} kg more for −₱100</span>
+              </div>
+            )}
             <div className="flex items-center justify-between text-xs">
               <span className="font-bold text-emerald-900">Estimated total</span>
               <span className="font-black text-emerald-800">₱{totalAmount.toFixed(2)}</span>

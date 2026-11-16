@@ -18,20 +18,20 @@ import {
   Clock3,
 } from 'lucide-react';
 import { UserRole, UserProfile } from '../types';
+import {
+  getRegisteredUsers,
+  saveRegisteredUser,
+  filterServerKnownUsers,
+  normalizePhone,
+} from '../utils/registeredUsers';
 import { AddressMapPickerModal } from './AddressMapPickerModal';
 import { ThemeToggleButton } from './ThemeToggleButton';
 import { fileToChatPhotoDataUrl } from '../utils/chatImage';
 import { describeDocFileError, isValidRsbsaNumber, RSBSA_FORMAT_HINT } from '../utils/verification';
+import { CLIENT_BUILD, useServerBuild } from '../utils/buildInfo';
 
 interface LoginRegisterViewProps {
   onLoginSuccess: (user: UserProfile) => void;
-}
-
-const REGISTERED_USERS_KEY = 'veggieconnect_registered_users_v9';
-
-function normalizePhone(p?: string): string {
-  if (!p) return '';
-  return p.replace(/[\s\-\+\(\)]/g, '').replace(/^63/, '0');
 }
 
 interface DocumentUploadFieldProps {
@@ -149,27 +149,34 @@ const DocumentUploadField: React.FC<DocumentUploadFieldProps> = ({
 export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
   onLoginSuccess,
 }) => {
-  // Load registered users from localStorage
-  const getRegisteredUsers = (): UserProfile[] => {
-    try {
-      const saved = localStorage.getItem(REGISTERED_USERS_KEY);
-      if (saved) {
-        return JSON.parse(saved);
-      }
-    } catch (e) {
-      console.error('Error loading registered users', e);
-    }
-    return [];
-  };
+  // Registered users come from the shared registry util
+  // (src/utils/registeredUsers.ts) so deletions can purge stale entries.
 
   const [activeTab, setActiveTab] = useState<'intro' | 'login' | 'register'>('intro');
   const [selectedRole, setSelectedRole] = useState<UserRole>('farmer');
+
+  // Build handshake: warn loudly when the RUNNING server process is an older
+  // build than this page (the classic "extracted a new zip but never restarted
+  // the server" case — new UI, old API, documents silently missing).
+  const { serverBuild, mismatch } = useServerBuild();
 
   // Login Form State
   const [loginIdentifier, setLoginIdentifier] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // ── Forgot-password flow (login page → DA Admin Console) ──────────────────
+  // The user enters the mobile number or email on the account plus the LAST
+  // password they remember. The server verifies that password before the
+  // request reaches the admin — only then does the account's PW button in
+  // the Admin Console turn red.
+  const [showForgot, setShowForgot] = useState(false);
+  const [fpContact, setFpContact] = useState('');
+  const [fpLastPassword, setFpLastPassword] = useState('');
+  const [fpError, setFpError] = useState<string | null>(null);
+  const [fpSuccess, setFpSuccess] = useState<string | null>(null);
+  const [fpBusy, setFpBusy] = useState(false);
 
   // Register Form State
   const [regName, setRegName] = useState('');
@@ -229,12 +236,6 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
   const [pinnedLocation, setPinnedLocation] = useState<{ address: string; lat: number; lng: number } | null>(null);
   const [showRegMap, setShowRegMap] = useState(false);
   const continueSignupAfterPinRef = React.useRef(false);
-
-  const saveRegisteredUser = (user: UserProfile) => {
-    const users = getRegisteredUsers();
-    const updated = [...users.filter((u) => u.id !== user.id), user];
-    localStorage.setItem(REGISTERED_USERS_KEY, JSON.stringify(updated));
-  };
 
   // Handle Login
   const handleLogin = async (e: React.FormEvent) => {
@@ -305,11 +306,52 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
     }
   };
 
+  // ── Forgot-password request (login page) ──────────────────────────────────
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setFpError(null);
+    setFpSuccess(null);
+    if (!fpContact.trim() || !fpLastPassword) {
+      setFpError('Enter the mobile number or email on your account AND the last password you remember.');
+      return;
+    }
+    setFpBusy(true);
+    try {
+      const resp = await fetch('/api/auth/request-password-reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contact: fpContact.trim(), lastPassword: fpLastPassword }),
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data?.success) {
+        setFpError(data?.error || 'Could not send the request — is the app server running?');
+      } else {
+        setFpSuccess(data.message);
+        setFpContact('');
+        setFpLastPassword('');
+      }
+    } catch (err) {
+      console.log('Reset request unreachable:', err);
+      setFpError('Could not reach the app server — check that the app is running.');
+    }
+    setFpBusy(false);
+  };
+
   // Handle Registration
+  // Auto-capitalize: "juan dela cruz" is stored as "Juan Dela Cruz" — the
+  // first letter of every lowercase word is capitalized in the details.
+  const titleCaseWords = (v: string) =>
+    v
+      .trim()
+      .replace(/\s+/g, ' ')
+      .split(' ')
+      .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+      .join(' ');
+
   const createAccount = async (pin: { address: string; lat: number; lng: number }) => {
     setIsSubmitting(true);
 
-    const trimmedName = regName.trim();
+    const trimmedName = titleCaseWords(regName);
     const rawPhone = regPhone.trim();
     const rawEmail = rawEmailSafe(regEmail.trim());
 
@@ -323,7 +365,7 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
       location: pin.address,
       latitude: pin.lat,
       longitude: pin.lng,
-      farmName: selectedRole === 'farmer' ? regFarmName.trim() : undefined,
+      farmName: selectedRole === 'farmer' ? titleCaseWords(regFarmName) : undefined,
       avatar: '',
       // DA verification workflow: NO immediate transactional access. The
       // account enters the Admin Console's Pending User Verifications queue
@@ -417,7 +459,32 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
     }
 
     // Local Duplicate Validations across all existing users
-    const existingUsers = getRegisteredUsers();
+    let existingUsers = getRegisteredUsers();
+
+    // Find every locally known account that collides with the requested
+    // identity. The local registry can be STALE: accounts deleted by the DA
+    // Admin used to stay in it forever, which blocked re-registering the same
+    // name/phone/email with "already registered" even though the account was
+    // gone from the server. The server is the source of truth — before
+    // blocking, confirm each candidate still exists server-side and purge the
+    // stale entries it no longer knows about.
+    const localDupes = existingUsers.filter(
+      (u) =>
+        (u.name && u.name.trim().toLowerCase() === normName) ||
+        (!!normPhone && u.phone && normalizePhone(u.phone) === normPhone) ||
+        (!!normEmail && u.email && u.email.trim().toLowerCase() === normEmail)
+    );
+    if (localDupes.length > 0) {
+      try {
+        const serverCheck = await fetch('/api/users');
+        if (serverCheck.ok) {
+          const serverUsers = await serverCheck.json();
+          existingUsers = filterServerKnownUsers(localDupes, serverUsers);
+        }
+      } catch {
+        // Server unreachable — fall back to the local registry as-is.
+      }
+    }
 
     // Check duplicate name
     const dupName = existingUsers.find((u) => u.name && u.name.trim().toLowerCase() === normName);
@@ -600,7 +667,7 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
       </div>
 
       {/* LOGIN FORM */}
-      {activeTab === 'login' && (
+      {activeTab === 'login' && !showForgot && (
         <form onSubmit={handleLogin} className="space-y-4 bg-white border border-emerald-100/90 rounded-3xl p-5 shadow-sm">
           <div className="border-b border-emerald-100 pb-3">
             <h2 className="text-base font-bold text-emerald-950">Log in to your account</h2>
@@ -661,6 +728,22 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
             <ArrowRight className="w-4 h-4" />
           </button>
 
+          <div className="text-center">
+            <button
+              id="btn-forgot-password"
+              type="button"
+              onClick={() => {
+                setShowForgot(true);
+                setFpError(null);
+                setFpSuccess(null);
+                setLoginError(null);
+              }}
+              className="text-[11px] font-bold text-emerald-700 hover:underline cursor-pointer"
+            >
+              Forgot password?
+            </button>
+          </div>
+
           <div className="text-center pt-2">
             <p className="text-xs text-neutral-500">
               Need a new member account?{' '}
@@ -676,6 +759,93 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
                 Register here
               </button>
             </p>
+          </div>
+        </form>
+      )}
+
+      {/* FORGOT PASSWORD FORM (login page flow → DA Admin Console) */}
+      {activeTab === 'login' && showForgot && (
+        <form onSubmit={handleForgotPassword} className="space-y-4 bg-white border border-emerald-100/90 rounded-3xl p-5 shadow-sm">
+          <div className="border-b border-emerald-100 pb-3">
+            <h2 className="text-base font-bold text-emerald-950">Forgot your password?</h2>
+            <p className="text-xs text-neutral-500 mt-0.5">
+              Enter the mobile number or email on your account and the LAST password you remember. The server
+              checks that password first — if it matches, the DA Admin gets your request and will set a
+              temporary password for you.
+            </p>
+          </div>
+
+          {fpError && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+              <span>{fpError}</span>
+            </div>
+          )}
+          {fpSuccess && (
+            <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800 flex items-start gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0 mt-0.5" />
+              <span>{fpSuccess}</span>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-xs font-semibold text-emerald-950 mb-1">
+              Mobile Number or Email
+            </label>
+            <div className="relative">
+              <Phone className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+              <input
+                id="input-forgot-contact"
+                type="text"
+                value={fpContact}
+                onChange={(e) => setFpContact(e.target.value)}
+                placeholder="0917 123 4567 or email"
+                className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 focus:outline-none focus:border-emerald-600 focus:bg-white transition-all"
+                required
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-emerald-950 mb-1">
+              The Last Password You Know
+            </label>
+            <div className="relative">
+              <Lock className="w-4 h-4 text-emerald-600 absolute left-3 top-3" />
+              <input
+                id="input-forgot-last-password"
+                type="password"
+                value={fpLastPassword}
+                onChange={(e) => setFpLastPassword(e.target.value)}
+                placeholder="Your previous password"
+                className="w-full bg-emerald-50/40 border border-emerald-200 rounded-xl py-2.5 pl-9 pr-3 text-xs text-neutral-900 focus:outline-none focus:border-emerald-600 focus:bg-white transition-all"
+                required
+              />
+            </div>
+          </div>
+
+          <button
+            id="btn-request-password-reset"
+            type="submit"
+            disabled={fpBusy}
+            className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md shadow-emerald-700/20 flex items-center justify-center gap-2 transition-all active:scale-[0.98] mt-2 cursor-pointer"
+          >
+            <span>{fpBusy ? 'Sending request...' : 'Request Password Reset'}</span>
+            <ArrowRight className="w-4 h-4" />
+          </button>
+
+          <div className="text-center pt-2">
+            <button
+              type="button"
+              onClick={() => {
+                setShowForgot(false);
+                setFpError(null);
+                setFpSuccess(null);
+              }}
+              className="text-[11px] font-bold text-emerald-700 hover:underline cursor-pointer"
+            >
+              ← Back to Log In
+            </button>
           </div>
         </form>
       )}
@@ -1041,8 +1211,17 @@ export const LoginRegisterView: React.FC<LoginRegisterViewProps> = ({
 
       {/* Subtle build marker — lets the owner confirm which build is running. */}
       <p className="text-center text-[10px] text-neutral-400 pt-5 pb-1 select-none">
-        VeggieConnect · Build v3.7 (DA Verification Queue • Admin Approval Before Login • Valid Government ID Upload • RSBSA &amp; Business Proof)
+        VeggieConnect · Build {CLIENT_BUILD} (App-Size Verification Review • Valid Government ID Loads on Any Device • DA Verification Queue • RSBSA &amp; Business Proof)
+        {serverBuild && serverBuild !== 'unknown' && ` · server ${serverBuild}`}
       </p>
+      {mismatch && (
+        <div className="mx-auto max-w-md mb-3 rounded-xl border border-red-300 bg-red-50 p-3 text-center text-[10px] font-bold text-red-700">
+          VERSION MISMATCH — this page is Build {CLIENT_BUILD} but the RUNNING app server is {serverBuild}.
+          Fully stop the app (Ctrl+C in its terminal), start it again from the newest code folder,
+          then hard-refresh this page (Ctrl+Shift+R). Until you restart, new features such as the
+          Valid Government ID document lookup will NOT work.
+        </div>
+      )}
     </div>
 
       {/* REQUIRED LOCATION MAP PICKER

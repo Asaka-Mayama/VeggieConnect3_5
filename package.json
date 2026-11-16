@@ -4,9 +4,9 @@
   "version": "3.3.3",
   "type": "module",
   "scripts": {
-    "dev": "tsx server.ts",
-    "dev:mysql": "node scripts/start-mysql.cjs && NODE_ENV=production tsx server.ts",
-    "dev:frontend": "tsx server.ts",
+    "dev": "tsx watch server.ts",
+    "dev:mysql": "node scripts/start-mysql.cjs && NODE_ENV=production tsx watch server.ts",
+    "dev:frontend": "tsx watch server.ts",
     "build": "vite build",
     "start": "NODE_ENV=production tsx server.ts",
     "db:push": "echo 'VeggieConnect: MySQL schema is auto-provisioned by server.ts - nothing to push.'",

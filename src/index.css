@@ -198,7 +198,12 @@ html.vc-dark .text-sky-800\/70 { color: rgba(147, 212, 242, 0.7); }
 html.vc-dark .text-amber-800\/70 { color: rgba(236, 206, 107, 0.7); }
 
 /* ---------- 8. Native scrollbars / form controls ---------- */
-html.vc-dark { scrollbar-color: #33423a #0e1510; }
+/* Hide scrollbars app-wide, every account (buyer / farmer / transporter /
+   admin): the visible bar stole ~15px of width and made the whole UI feel
+   small. Scrolling still works everywhere — mouse wheel, touchpad, touch
+   drag and keyboard — the bar itself is just no longer drawn. */
+html { scrollbar-width: none; -ms-overflow-style: none; }
+*::-webkit-scrollbar { width: 0; height: 0; display: none; }
 
 /* ============================================================
    Theme toggle button (per-role dark mode switch)

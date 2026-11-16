@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root { --text: #111827; --text-sub: #6B7280; --border: #E5E7EB; --connector: #94A3B8; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #FFFFFF; color: var(--text); -webkit-font-smoothing: antialiased;
+  }
+  #root { width: fit-content; min-width: 900px; max-width: 980px; margin: 0 auto; padding: 44px 40px; background: #FFFFFF; }
+  .flow-title { font-size: 22px; font-weight: 700; text-align: center; }
+  .flow-subtitle { font-size: 13px; color: var(--text-sub); text-align: center; margin-top: 8px; margin-bottom: 34px; }
+
+  .phase-group { background: #F8FAFC; border-radius: 12px; padding: 20px 24px; }
+  .phase-title { font-size: 16px; font-weight: 700; padding: 10px 16px; border-radius: 8px; margin-bottom: 14px; }
+  .phase-steps { display: flex; flex-direction: column; gap: 8px; padding-left: 12px; }
+  .phase-step {
+    font-size: 14px; color: var(--text); padding: 9px 14px; background: white;
+    border-radius: 6px; border: 1px solid var(--border); line-height: 1.45;
+  }
+  .phase-step .step-num {
+    display: inline-block; width: 22px; height: 22px; line-height: 22px; text-align: center;
+    border-radius: 50%; font-size: 12px; font-weight: 600; margin-right: 8px;
+  }
+  .phase-step .actor { display: inline-block; font-size: 11px; font-weight: 600; color: #1E3050;
+    background: #E0E7EF; border-radius: 10px; padding: 1px 8px; margin-right: 6px; vertical-align: 1px; }
+
+  /* Scheme B — neutral gray base + blue accent progression (5 phases) */
+  .phase-1 .phase-title { background: #F1F5F9; color: #334155; border-left: 4px solid #94A3B8; }
+  .phase-1 .step-num { background: #E2E8F0; color: #475569; }
+  .phase-2 .phase-title { background: #E8EDF3; color: #2D4156; border-left: 4px solid #7B8FA3; }
+  .phase-2 .step-num { background: #DBE5EE; color: #2D4156; }
+  .phase-3 .phase-title { background: #E2E8F0; color: #283C52; border-left: 4px solid #6B809A; }
+  .phase-3 .step-num { background: #D0D9E4; color: #283C52; }
+  .phase-4 .phase-title { background: #DAE1EB; color: #23364D; border-left: 4px solid #5B7590; }
+  .phase-4 .step-num { background: #C7D2E0; color: #23364D; }
+  .phase-5 .phase-title { background: #D2DAE5; color: #1E3048; border-left: 4px solid #4B6A87; }
+  .phase-5 .step-num { background: #BFC9D8; color: #1E3048; }
+
+  .phase-arrow { text-align: center; color: var(--connector); font-size: 24px; margin: 6px 0; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div class="flow-title">VeggieConnect — Order Lifecycle &amp; Pay-After-Approval Gate</div>
+  <div class="flow-subtitle">Buyers cannot pay before the DA Admin approves an order, and live transport refuses unpaid hauls</div>
+
+  <div class="phase-group phase-1">
+    <div class="phase-title">Phase 1 · Browse, Cart &amp; Request (Buyer)</div>
+    <div class="phase-steps">
+      <div class="phase-step"><span class="step-num">1</span><span class="actor">BUYER</span>Browse the market and farm directory; product cards offer &ldquo;Add to Cart&rdquo; only</div>
+      <div class="phase-step"><span class="step-num">2</span><span class="actor">BUYER</span>Checkout enforces both minimums — 60 kg total order and 20 kg per product</div>
+      <div class="phase-step"><span class="step-num">3</span><span class="actor">BUYER</span>Raise purchase requests from the Cart; the &ldquo;Choose a vegetable&rdquo; list is built live from the market menu</div>
+    </div>
+  </div>
+  <div class="phase-arrow">↓</div>
+
+  <div class="phase-group phase-2">
+    <div class="phase-title">Phase 2 · Order Placement &amp; Admin Review</div>
+    <div class="phase-steps">
+      <div class="phase-step"><span class="step-num">4</span><span class="actor">SYSTEM</span>Order is stored (MySQL <code>orders</code>) with totals, delivery fee and payment method</div>
+      <div class="phase-step"><span class="step-num">5</span><span class="actor">ADMIN</span>DA Admin reviews the order in Buyer Requests; buyer sees &ldquo;Awaiting Admin approval&rdquo;</div>
+    </div>
+  </div>
+  <div class="phase-arrow">↓</div>
+
+  <div class="phase-group phase-3">
+    <div class="phase-title">Phase 3 · Pay-After-Approval Payment Gate</div>
+    <div class="phase-steps">
+      <div class="phase-step"><span class="step-num">6</span><span class="actor">BUYER</span>Once approved, the Orders screen shows &ldquo;Order approved — pay to start the transaction&rdquo;</div>
+      <div class="phase-step"><span class="step-num">7</span><span class="actor">BUYER</span>Pay Now from the VeggieConnect Pay wallet → order marked <b>PAID ✓ WALLET</b>; wallet history records the payment</div>
+    </div>
+  </div>
+  <div class="phase-arrow">↓</div>
+
+  <div class="phase-group phase-4">
+    <div class="phase-title">Phase 4 · Live Transport (Admin-Controlled)</div>
+    <div class="phase-steps">
+      <div class="phase-step"><span class="step-num">8</span><span class="actor">ADMIN</span>Admin advances the haul in Live Transport; the system refuses unpaid orders (&ldquo;Buyer payment required&rdquo;)</div>
+      <div class="phase-step"><span class="step-num">9</span><span class="actor">ADMIN</span>Transport job tracks pickup farm → drop-off location with estimated weight and driver earnings</div>
+    </div>
+  </div>
+  <div class="phase-arrow">↓</div>
+
+  <div class="phase-group phase-5">
+    <div class="phase-title">Phase 5 · Completion &amp; Settlement</div>
+    <div class="phase-steps">
+      <div class="phase-step"><span class="step-num">10</span><span class="actor">SYSTEM</span>Completed transactions reduce warehouse stock automatically</div>
+      <div class="phase-step"><span class="step-num">11</span><span class="actor">ADMIN</span>Unavailable product lines → &ldquo;Mark Unavailable &amp; Return Amount&rdquo; refunds the buyer wallet while the order continues</div>
+      <div class="phase-step"><span class="step-num">12</span><span class="actor">BUYER</span>Buyer rates the order; farmer ledger groups sales by date with daily totals</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

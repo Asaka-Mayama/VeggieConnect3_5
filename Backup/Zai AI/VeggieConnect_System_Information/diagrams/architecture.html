@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --text: #111827; --text-sub: #6B7280; --border: #E5E7EB;
+    --connector: #94A3B8;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: #FFFFFF; color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  #root { width: fit-content; min-width: 1060px; margin: 0 auto; padding: 44px 40px; background: #FFFFFF; }
+  .flow-title { font-size: 22px; font-weight: 700; text-align: center; }
+  .flow-subtitle { font-size: 13px; color: var(--text-sub); text-align: center; margin-top: 8px; margin-bottom: 36px; }
+
+  .layer { display: flex; gap: 16px; align-items: stretch; margin-bottom: 0; }
+  .layer-label {
+    flex: 0 0 168px; display: flex; flex-direction: column; justify-content: center;
+    border-radius: 10px; padding: 12px 16px;
+  }
+  .layer-label .ll-name { font-size: 14px; font-weight: 700; }
+  .layer-label .ll-tech { font-size: 11.5px; margin-top: 4px; opacity: 0.85; }
+  .layer-cards { flex: 1; display: flex; gap: 12px; }
+  .card {
+    flex: 1; background: #F8FAFC; border: 1.5px solid var(--border);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .card .c-title { font-size: 14.5px; font-weight: 600; }
+  .card .c-desc { font-size: 12px; color: var(--text-sub); margin-top: 5px; line-height: 1.5; }
+  .card.accent { border-color: #3A5C7A; background: #EFF6FF; }
+  .card.ext { border-color: #5B7A99; background: #F0F4F8; }
+  .card.db { border-color: #2A7A65; background: #F0FDF4; }
+
+  /* Layer label colors — same-hue blue-gray progression */
+  .l1 { background: #F0F4F8; border-left: 4px solid #64748B; }
+  .l1 .ll-name { color: #334155; } .l1 .ll-tech { color: #64748B; }
+  .l2 { background: #E8EDF2; border-left: 4px solid #5B7A99; }
+  .l2 .ll-name { color: #1E3A5F; } .l2 .ll-tech { color: #52708F; }
+  .l3 { background: #E0E7EF; border-left: 4px solid #4A6B8A; }
+  .l3 .ll-name { color: #1E3050; } .l3 .ll-tech { color: #466482; }
+  .l4 { background: #D8E0EA; border-left: 4px solid #3A5C7A; }
+  .l4 .ll-name { color: #172540; } .l4 .ll-tech { color: #3A5876; }
+  .l5 { background: #D0D9E4; border-left: 4px solid #2A4C6A; }
+  .l5 .ll-name { color: #12203A; } .l5 .ll-tech { color: #2E4C6A; }
+
+  .arrow-row { text-align: center; color: var(--connector); font-size: 22px; line-height: 1.15; padding: 4px 0; }
+  .arrow-note { font-size: 11.5px; color: var(--text-sub); margin-top: 1px; }
+  .legend {
+    display: flex; gap: 24px; justify-content: center; margin-top: 30px;
+    padding: 14px 24px; background: #F9FAFB; border-radius: 8px; border: 1px solid #E5E7EB;
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #4B5563; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 3px; border: 2px solid; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div class="flow-title">VeggieConnect — System Architecture</div>
+  <div class="flow-subtitle">Single Express server hosting a React 19 single-page app, backed by MySQL (XAMPP) and external Google services</div>
+
+  <div class="layer">
+    <div class="layer-label l1"><div class="ll-name">Client Layer</div><div class="ll-tech">Browser · mobile-first frame</div></div>
+    <div class="layer-cards">
+      <div class="card"><div class="c-title">Buyer App</div><div class="c-desc">Market, cart &amp; checkout, orders, wallet, chat</div></div>
+      <div class="card"><div class="c-title">Farmer App</div><div class="c-desc">Produce listings, incoming orders, sales ledger, chat</div></div>
+      <div class="card accent"><div class="c-title">DA Admin Console</div><div class="c-desc">Verification, stocks, orders &amp; live transport, analytics</div></div>
+    </div>
+  </div>
+  <div class="arrow-row">↓<div class="arrow-note">HTTPS — same-origin fetch calls</div></div>
+
+  <div class="layer">
+    <div class="layer-label l2"><div class="ll-name">Presentation</div><div class="ll-tech">React 19 · Vite 8 · Tailwind CSS 4</div></div>
+    <div class="layer-cards">
+      <div class="card"><div class="c-title">Role-based views</div><div class="c-desc">src/App.tsx routes buyer / farmer; AdminApp.tsx mounts the /admin console</div></div>
+      <div class="card"><div class="c-title">Local caches &amp; self-heal</div><div class="c-desc">localStorage registries; pending signup / deletion queues replay until server confirms</div></div>
+      <div class="card"><div class="c-title">Map &amp; UI components</div><div class="c-desc">@vis.gl/react-google-maps pin picker, farm-route map; lucide-react icons; motion</div></div>
+    </div>
+  </div>
+  <div class="arrow-row">↓<div class="arrow-note">REST / JSON</div></div>
+
+  <div class="layer">
+    <div class="layer-label l3"><div class="ll-name">Application</div><div class="ll-tech">Express 4 — single server.ts (3,500+ lines)</div></div>
+    <div class="layer-cards">
+      <div class="card"><div class="c-title">REST API — 27 endpoints</div><div class="c-desc">auth · users · wallet · products · orders · transport jobs · messages · DA prices</div></div>
+      <div class="card"><div class="c-title">Business rules</div><div class="c-desc">PBKDF2 password hashing · duplicate identity checks · 60 kg / 20 kg minimums · pay-after-approval gate</div></div>
+      <div class="card"><div class="c-title">Static hosting</div><div class="c-desc">Serves the built SPA (vite build) and SPA-fallback routing in production</div></div>
+    </div>
+  </div>
+  <div class="arrow-row">↓<div class="arrow-note">mysql2 pool — schema auto-provisioned &amp; migrated on boot</div></div>
+
+  <div class="layer">
+    <div class="layer-label l4"><div class="ll-name">Data</div><div class="ll-tech">MySQL (XAMPP) · CREATE TABLE IF NOT EXISTS + ALTER migrations</div></div>
+    <div class="layer-cards">
+      <div class="card db"><div class="c-title">users · products</div><div class="c-desc">Accounts (role, verification, wallet) and produce listings (stock, sourcing)</div></div>
+      <div class="card db"><div class="c-title">orders · transport_jobs</div><div class="c-desc">Orders, payment state and admin-hauled delivery jobs</div></div>
+      <div class="card db"><div class="c-title">direct_messages · da_price_bulletin</div><div class="c-desc">Persisted chat and DA retail / farm-gate price bulletins</div></div>
+    </div>
+  </div>
+  <div class="arrow-row">↓</div>
+
+  <div class="layer">
+    <div class="layer-label l5"><div class="ll-name">External Services</div><div class="ll-tech">Called server-side or with browser API keys</div></div>
+    <div class="layer-cards">
+      <div class="card ext"><div class="c-title">Google Maps JavaScript API</div><div class="c-desc">Address pinning at registration, farm-route visualisation</div></div>
+      <div class="card ext"><div class="c-title">Google Gemini API</div><div class="c-desc">@google/genai — AI features behind GEMINI_API_KEY</div></div>
+    </div>
+  </div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="border-color:#94A3B8;background:#F8FAFC;"></div>Internal module</div>
+    <div class="legend-item"><div class="legend-dot" style="border-color:#2A7A65;background:#F0FDF4;"></div>MySQL table group</div>
+    <div class="legend-item"><div class="legend-dot" style="border-color:#5B7A99;background:#F0F4F8;"></div>External service</div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,225 @@
+VeggieConnect3_3 source delivery
+Built: 2026-11-14 (latest — Build v3.4 "Buyer Wallet & Pay-After-Approval")
+How to confirm you are on THIS build:
+  The login screen shows "VeggieConnect · Build v3.4 (Buyer Wallet & Deposit • Pay-After-Approval Before Live Transaction • Unavailable-Product Refunds)" at the bottom.
+  If you do NOT see that tag, you are running an older extraction —
+  replace your whole code folder with this zip and restart the app.
+
+Important: when extracting, do NOT mix with an old copy.
+  1. Close the running app (Ctrl+C).
+  2. Delete or rename your previous VeggieConnect3_2/3_3 code folder.
+  3. Extract THIS zip into a fresh folder.
+  4. `bun install` then `bun run dev` (or npm install / npm run dev).
+  5. Hard refresh the browser (Ctrl+Shift+R).
+
+NEW IN BUILD v3.4 (all verified end-to-end in the running app):
+
+1. BUYER WALLET — "VeggieConnect Pay" WITH DEPOSIT (PROTOTYPE)
+   A new Wallet tab sits in the buyer's bottom navigation (and in Profile ▸
+   VeggieConnect Pay Wallet shortcut):
+   - A gradient balance card always shows the current peso balance.
+   - The green "Deposit" button opens a deposit panel with quick amounts
+     (₱500 / ₱1,000 / ₱2,000 / ₱5,000) plus a custom amount field —
+     prototype mode, simulated gateway, no real money charged.
+   - Every deposit, order payment and refund is recorded in the Wallet
+     History list with time, description and the balance after each move.
+   - The balance is stored on the buyer account (server-side) so it
+     survives restarts and is visible across devices.
+
+2. PAY-AFTER-APPROVAL PAYMENT FLOW (LIVE TRANSACTION GATE)
+   The order flow is now: Buyer places order → Admin approves → Buyer pays
+   from the wallet → live transaction may start:
+   - While pending, the buyer's Orders screen shows "Awaiting Admin approval
+     — pay ₱X from your wallet once approved."
+   - Once approved, an "Order approved — pay to start the transaction"
+     panel appears with a big "Pay Now from Wallet • ₱X" button.
+   - Paying marks the order PAID ✓ WALLET (buyer card + admin card) and
+     unlocks everything downstream.
+   - Admin ▸ Live Transport REFUSES to advance a haul whose buyer order is
+     unpaid ("Buyer payment required — … pays from their Wallet").
+   - Admin ▸ Buyer Requests completion button becomes "Awaiting Buyer
+     Wallet Payment" (grey) until paid; then "Mark Picked Up & Paid" works.
+   - The buyer's "Confirm Received" button only appears on PAID orders.
+   - Insufficient balance? Pay Now explains exactly what is missing and a
+     "Balance low? Open Wallet to deposit" shortcut is right under it.
+
+3. UNAVAILABLE PRODUCT → RETURN THE AMOUNT, ORDER CONTINUES
+   In Admin ▸ Buyer Requests every product line now carries a "Mark
+   Unavailable & Return Amount" button:
+   - Marking a product unavailable returns its peso amount to the buyer:
+     PAID orders credit the buyer's VeggieConnect Pay wallet instantly
+     (Wallet History shows the refund); UNPAID orders simply drop the
+     amount from the bill (buyer pays the reduced total).
+   - The product line is marked UNAVAILABLE (struck through for the buyer,
+     red banner for the admin) and the transaction is NOT cancelled — it
+     continues with the remaining products.
+   - Cancelling a whole order (Decline) after payment returns the buyer's
+     remaining money to the wallet automatically.
+
+EARLIER BUILDS (v3.3.3 and below) are still included in this source: date
+
+1. FARMER ▸ ORDERS — TRANSACTIONS CATEGORISED BY DATE + TOTAL SALES PER DATE
+   The Orders menu in the farmer account now groups every transaction under
+   its calendar day so the farmer knows exactly what happened on each date:
+   - A scrollable DATE CHIP ROW sits under the status tabs: "All Dates"
+     plus one chip per date ("Today", "Yesterday", "Nov 12, 2026"...) each
+     showing how many transactions happened that day. Tapping a chip shows
+     only that date's transactions; "All Dates" shows everything grouped.
+   - A dark green TOTAL SALES SUMMARY CARD sits above the list and always
+     reports the SELECTED date: the big peso figure is the day's total
+     sales, plus "N Transactions", plus a split of "Delivered ₱X ·
+     In Progress ₱Y" (cancelled orders are never counted as sales — same
+     basis as the farmer dashboard's Total Sales).
+   - Inside the list, a date section header ("Saturday, November 14, 2026")
+   is rendered above the first order of each day and carries that day's
+   own "Sales: ₱X" subtotal and transaction count.
+   - Every order card's collapsed header now also shows its exact
+     date/time (e.g. "Nov 14, 2026, 8:28 AM").
+   - Everything still respects the All/Active/Completed/Cancelled tabs —
+     the date chips and status tabs combine.
+
+2. ADMIN ▸ ORDERS ▸ ALL LEDGER — DATE CATEGORIES SPLIT BY FARMER vs BUYER
+   The All Ledger section in the admin account now categorises every
+   transaction BY DATE and BY USER TYPE, with the money totals for each:
+   - A DATE CHIP ROW ("All Dates 4 · Today 2 · Yesterday 1 · Nov 12, 2026
+     1"...) filters the ledger to a single calendar day; "All Dates"
+     groups everything day by day.
+   - A TRANSACTION CATEGORIES SUMMARY CARD reports for the selected date:
+     * BUYER TRANSACTIONS — "Total Sales (money in)" ₱X with the buyer
+       transaction count (produce sold to buyer users).
+     * FARMER TRANSACTIONS — "Total Cost (farm-gate payout)" ₱Y with the
+       farmer transaction count (admin procurements from farmer users;
+       cost uses the farm-gate amount the admin pays the grower).
+     * "Margin (Buyer Sales − Farmer Cost)" ₱Z for the selected date.
+     Cancelled transactions are excluded from the money totals (badge:
+     "Cancelled excluded").
+   - The list itself is grouped under per-date headers, and inside every
+     date the transactions are split into two labelled categories:
+     "🛍 BUYER TRANSACTIONS (SALES) — ₱X" and "🌱 FARMER TRANSACTIONS
+     (COST) — ₱Y", each with its own per-date subtotal in the header.
+   - The categorisation rule matches the Buyer Requests queue exactly:
+     admin procurement rows (buyerId admin-main / TX-ADM- ids / Admin Desk
+     buyer name) are farmer transactions; everything else is a buyer sale.
+   - Date chips combine with the existing status filter chips and the
+     search box.
+
+NEW IN BUILD v3.3.2 (still included, unchanged):
+
+1. "REQUEST" BUTTON REMOVED FROM EVERY MARKET PRODUCT (Buyer)
+   Buyer ▸ Market: each product card now shows ONLY the "Add to Cart"
+   button — the per-product "Request" button is gone. The product detail
+   modal also no longer has a "Request {qty} {unit}" button; it now shows
+   the quantity stepper plus "Add {qty} {unit} to Cart".
+   Purchase requests are raised exclusively from the Cart menu via the
+   "Request Crops" button (Build v3.3.1 behavior, unchanged).
+
+2. MINIMUM ORDER UPDATED: 60 KG TOTAL *AND* 20 KG PER PRODUCT
+   A buyer order must satisfy BOTH rules (Cart checkout AND the
+   "Request Crops" modal enforce the same gates):
+   - TOTAL: the kg of every product are added together and the combined
+     total must reach AT LEAST 60 kg (e.g. 40 kg Okra + 20 kg Tomatoes
+     = 60 kg). Buying more than one product is fine.
+   - PER PRODUCT: every product line must be AT LEAST 20 kg on its own
+     (e.g. 60 kg of a single product is valid; 10 kg Okra + 50 kg
+     Tomatoes is NOT, because Okra is below 20 kg).
+   How it is enforced:
+   - Market cards: "Add to Cart" is disabled for products stocked with
+     less than 20 kg (hover explains "Needs at least 20 kg per product").
+   - Tapping "Add to Cart" stages 20 kg of the product (the per-product
+     minimum) — the buyer then adjusts upward.
+   - Product detail modal: the stepper starts at 20 kg and cannot go
+     below it; a note shows "Min 20 kg per product / Total order min 60 kg".
+   - Cart: the minus button cannot go below 20 kg (use the new trash
+     button to remove a product line entirely). A warning lists every
+     product below 20 kg; the submit button says "Each product needs
+     20 kg or more" when violated, or "Need X more kg to submit" when
+     the 60 kg total is not yet reached.
+   - Request Crops modal: the quantity picker starts at 20 kg and cannot
+     go below; the same per-product warning + 60 kg total progress bar
+     gate the submit button.
+
+FIXES CARRIED FROM BUILD v3.3.1 (all still verified in this build):
+
+1. "CHOOSE A VEGETABLE" NOW LISTS ONLY WHAT IS ON THE MARKET MENU
+   In Buyer ▸ Market ▸ Request Crops ▸ "Add Vegetable to Request", the
+   "Choose a Vegetable" dropdown no longer shows a fixed preset list.
+   It is filled live from the Market menu itself — every option is a real
+   shelf product with its live buyer price and available stock
+   (e.g. "Okra — ₱38.50/kg • 30 kg available"). Sold-out crops are not
+   offered, because the buyer can only buy what the Market menu stocks.
+
+2. "OR TYPE NAME" REMOVED
+   The free-text "Or type vegetable name..." input is gone. Vegetables are
+   chosen exclusively from the Market-linked dropdown, so requests can
+   never contain a product that is not actually stocked on the Market.
+
+3. MINIMUM ORDER — SUMMED ACROSS ALL PRODUCTS (raised to 60 kg in v3.3.2)
+   Originally 50 kg; as of Build v3.3.2 the total minimum is 60 kg plus a
+   20 kg per-product minimum — see "NEW IN BUILD v3.3.2" item 2 above.
+   - A live progress bar shows "Minimum Order: 60 kg total • 20 kg per product".
+   - The submit button stays disabled and says "Need X more kg to submit".
+   - The same gates are enforced in the Cart checkout and Request Crops modal.
+
+4. "ADD TO CART" FOR BUYERS
+   - Every product card on the Market has an "Add to cart" button (bag
+     icon; shows a check when the crop is already in the cart), and the
+     product detail modal has an "Add {qty} {unit} to Cart" button that
+     adds the stepped quantity.
+   - A new CART tab in the buyer bottom navigation (with an item-count
+     badge) opens the cart drawer where the buyer reviews, edits or clears
+     each staged product, then submits one combined Purchase Request to
+     the Admin — no need to re-enter every product one by one.
+
+5. DELETE BUTTON ON EVERY PRODUCT IN ADMIN ▸ STOCKS
+   Each Warehouse Stocks card now has a red Delete button. Confirming it
+   removes the product and ALL its stocking lots from the warehouse, the
+   buyer-facing Market and buyer carts (each lot is also DELETEd on the
+   backend). A completed procurement is no longer resurrected as a
+   ghost card after its real stock records were deleted.
+
+FIXES CARRIED FROM BUILD v3.3 (all still verified in this build):
+
+1. BLANK SCREEN FIXED — Live Transport confirm (Admin)
+   Pressing any confirm button in Admin ▸ Transactions ▸ Live Transport
+   ("I'll Pick This Up", "Mark Crates Loaded", "Start In-Transit",
+   "Confirm Delivery & Stock Received in Supermarket") used to blank the
+   whole screen when the console held an order without a farm name
+   (a "phantom" order created by a status-only sync after a backend restart).
+   - The backend no longer creates phantom orders: a status-only update for
+     an unknown order id is rejected (404) instead of being inserted.
+   - Every order sent to the app now carries plain-string farmName/buyerName.
+   - All client state updaters are crash-proofed (safe string handling).
+
+2. STOCK NOW REDUCES AFTER A COMPLETED TRANSACTION (Admin ▸ Stocks)
+   Previously: buyer bought 30kg of okra, admin had 50kg — after the
+   transaction completed the Stocks menu still showed 50kg.
+   Root causes fixed:
+   - Warehouse stock shown in the Stocks menu could be a "virtual" record
+     derived from a procurement order; it could never be deducted. Now every
+     delivered procurement ("Confirm Delivery & Stock Received in
+     Supermarket") materializes REAL warehouse stock (record id sm-<crop>)
+     in memory + MySQL, and startup backfills procurements that were
+     delivered before this fix.
+   - Request-lot deductions (fulfill buyer request, complete, cancel
+     restock) now target ONLY warehouse-owned records — a farmer's listing
+     is never silently reduced instead.
+   - The Stocks menu aggregates multiple warehouse lots of one crop by SUM
+     (Math.max used to hide reductions that landed on a smaller lot).
+   - Procurement orders no longer double-deduct the farmer's listing at
+     POST /api/orders (the client already reduced it once at Buy time).
+
+3. FARMER CONFIRMS FIRST — BEFORE THE LIVE TRANSACTION STARTS
+   - Farmer ▸ Orders: a pending supermarket procurement (direct delivery)
+     now shows a "Confirm Order (Fresh-Pick & Ready for Pickup)" button.
+   - Admin ▸ Live Transport: a haul whose linked order is still pending
+     shows "Awaiting Farmer Confirmation" instead of action buttons.
+   - The backend also rejects (409) any attempt to accept / load / drive /
+     deliver a haul while the supplying farmer has not confirmed yet.
+
+Everything from Build v3.2.1 is still included (10% admin commission split,
+direct chat, photo uploads, map pin registration, etc. — see changelog below).
+
+Setup: see README.md — requires XAMPP MySQL (127.0.0.1:3306, root) and bun/npm.
+No MySQL running? The app still starts in resilient in-memory mode.
+`npm run dev:mysql` additionally auto-provisions a throwaway MySQL so you can
+try the app without XAMPP (uses mysql-memory-server, sandbox convenience).

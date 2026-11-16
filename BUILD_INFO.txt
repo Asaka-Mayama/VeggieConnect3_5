@@ -1,18 +1,490 @@
-VeggieConnect3_3 source delivery
-Built: 2026-11-14 (latest — Build v3.4 "Buyer Wallet & Pay-After-Approval")
+VeggieConnect3_4 source delivery
+Built: 2026-11-16 (latest — Build v4.12 "Crisper Requests, Wider UI")
 How to confirm you are on THIS build:
-  The login screen shows "VeggieConnect · Build v3.4 (Buyer Wallet & Deposit • Pay-After-Approval Before Live Transaction • Unavailable-Product Refunds)" at the bottom.
-  If you do NOT see that tag, you are running an older extraction —
+  The login screen shows "VeggieConnect · Build v4.12 (...) · server v4.12" at the bottom.
+  BOTH numbers MUST say v4.12. If they differ (or a red VERSION MISMATCH banner
+  appears), the RUNNING server process is an older build:
+  fully stop the app (Ctrl+C / close the terminal), start it again, and
+  hard-refresh the browser (Ctrl+Shift+R).
+  If you do NOT see that tag at all, you are running an older extraction —
   replace your whole code folder with this zip and restart the app.
 
 Important: when extracting, do NOT mix with an old copy.
-  1. Close the running app (Ctrl+C).
-  2. Delete or rename your previous VeggieConnect3_2/3_3 code folder.
+  1. Close the running app (Ctrl+C). The server MUST be restarted after every
+     extraction — a running `tsx server.ts` process does NOT load new code
+     from files extracted later (only the browser pages refresh from disk,
+     which is exactly why the Valid Government ID kept showing "Missing"
+     while everything else looked up to date).
+  2. Delete or rename your previous VeggieConnect3_2/3_3/3_4 code folder.
   3. Extract THIS zip into a fresh folder.
-  4. `bun install` then `bun run dev` (or npm install / npm run dev).
+  4. `bun install` then `bun run dev` (or `npm install` / `npm run dev` —
+     if npm complains about peer dependencies use: npm install --legacy-peer-deps).
+     `npm run dev` now uses `tsx watch`, so future code updates restart the
+     server automatically.
   5. Hard refresh the browser (Ctrl+Shift+R).
 
-NEW IN BUILD v3.4 (all verified end-to-end in the running app):
+NEW IN BUILD v4.12 (verified end-to-end — 12/12 v4.11 checks still pass plus
+new static checks; all eleven v4.0–v4.10 regression suites passed):
+
+1. COLORED "requested" LABEL (Admin → Orders → Buyer Requests)
+   The "(60 kgs requested)" text beside each product in the Inventory Check
+   panel was tiny light-gray and easy to miss. It is now a colored pill:
+   GREEN (emerald) when warehouse stock can cover the requested kilograms,
+   AMBER when it cannot — matching the availability dot next to it. The
+   requested quantity is immediately visible at a glance.
+
+2. SCROLLBARS REMOVED APP-WIDE (every account)
+   The visible scrollbar stole ~15px of width and shrank the whole UI.
+   Scrollbars are now hidden on every screen for buyer / farmer /
+   transporter / admin (and inside every panel). Scrolling itself still
+   works exactly as before — mouse wheel, touchpad, touch drag, keyboard —
+   only the drawn bar is gone, so the interface is wider and cleaner.
+
+LEGACY BUILD NOTES (v4.11) — Partial Fulfillment Choice:
+
+1. PARTIAL FULFILLMENT CHOICE ON BUYER REQUESTS (Admin → Buyer Requests)
+   Fulfilling a request whose stock is insufficient used to be a dead end —
+   the Fulfil button was blocked with a warning toast. Now:
+   • Automatic fulfillment is still BLOCKED when stock cannot cover the
+     request (the admin never silently sells short).
+   • The admin gets an explicit CHOICE: an "Insufficient Stock" modal opens
+     showing, per product, how many kg are available vs requested (FULL /
+     PARTIAL / NONE badges).
+   • "Fulfil Available" delivers ONLY the available products and charges the
+     buyer ONLY for them — never the full transaction amount. The shortfall
+     is recorded as a refund on the order: credited to the buyer's
+     VeggieConnect Pay wallet when the order was already paid, dropped from
+     the bill when it was not. Fully-unavailable lines become "Unavailable"
+     rulings; partially-covered lines keep their fixed buyer price and carry
+     a shortfall note ("6 of 10 kg fulfilled").
+   • "Cancel — Source More Stock" backs out so the admin can buy more from
+     farmers (Build v4.10 puts those kilograms straight into the Stocks
+     menu) and fulfil in full afterwards.
+   • The buyer sees the same facts: a shortfall badge on the order line
+     ("4 of 10 kg fulfilled • ₱264.00 returned"), a receipt line for the
+     returned amount, and the order note explains the partial fulfillment.
+   Verified: a paid 10 kg request (₱440) with only 4 kg left fulfils
+   partially — warehouse deducts exactly 4 kg, the buyer owes ₱176
+   (4 × ₱44), ₱264 is recorded as refunded/credited, and the sourcing
+   engine allocates the adjusted 4 kg only.
+
+2. RENAMED "Mark Unavailable & Return Amount" → "Mark Unavailable"
+   (Admin → Buyer Requests). Same behavior: the line's amount is returned
+   to the buyer's wallet when paid / removed from the bill when unpaid, and
+   the order continues with the remaining products. The button tooltip keeps
+   the full explanation.
+
+LEGACY BUILD NOTES (v4.10) — Procurement Lands in Stocks:
+
+FIXED — STOCK BOUGHT FROM A FARMER NOW LANDS IN THE STOCKS MENU (EVEN WITH AN
+ACTIVE BUYER TRANSACTION OPEN)
+  The bug: the quantity the admin bought from a farmer did not ADD to the
+  Stocks menu while an active transaction between the admin and a buyer user
+  existed.
+
+  Three defects were found and fixed:
+  1. DOUBLE DEDUCTION → SKIPPED STOCKING. The buy desk wrote the farmer's
+     remaining stock to the backend BEFORE posting the procurement order;
+     the backend engine then deducted the same farmer lot AGAIN. When the
+     desk bought the WHOLE listing, the lot read 0 by the time the engine
+     ran — its allocation came back empty and it early-returned, skipping
+     the warehouse stocking step entirely. The bought kilograms never
+     reached the Stocks menu. Now: the desk no longer writes stock at all
+     (the backend engine is the single writer — deducted exactly once), and
+     the engine stocks the warehouse for EVERY committed purchase, even
+     when the farmer lot was already empty.
+  2. FLAG LOSS → DOUBLE-STOCKED SHELF ON DELIVERY. Orders fulfilled the
+     moment they were posted (the desk posts them as 'confirmed') never got
+     their exactly-once warehouseStockAdded flag pinned — the order was not
+     in the ledger yet when the engine pinned it. A later "Confirm Delivery"
+     then added the SAME kilograms a second time. Now the order row is
+     written to the ledger BEFORE fulfillment runs, so the flag always
+     lands and delivery confirm can never double-add.
+  3. AUDIT TRAIL. The farmer listing's boughtQuantity (how much the admin
+     has bought from that farmer in total) is now written by the same
+     single-writer engine, so it can never double-count either.
+
+  Verified: partial buy (20 of 30 → lot 10, warehouse +20), whole-listing
+  buy (15 of 15 → lot 0, warehouse +15 immediately), legacy pre-deducted
+  race path (warehouse still +25), delivery confirm adds nothing more, the
+  buyer's active transaction is untouched, and farmer lots never go
+  negative.
+
+LEGACY BUILD NOTES (v4.9):
+
+
+FIXED — RE-LISTING THE SAME CROP MERGES INTO ONE CARD (NO DUPLICATES)
+  The bug: when a farmer listed the same product again (e.g. Calamansi), a
+  SECOND card appeared — in the farmer's My Crops section AND in the admin's
+  Crops section.
+
+  The fix:
+  • The server now merges a farmer's re-listing into their existing listing
+    when it is the SAME farmer, the same crop (name matched loosely, so
+    "Okra" merges with "Okra (Lady Finger)") and the same unit. The merged
+    card keeps the original record's id (so orders referencing it stay
+    valid), takes the NEW price, and SUMS the stock (30 kg + 20 kg = 50 kg).
+    Rating and review count survive the merge.
+  • Deliberately NOT merged (they stay separate cards): a different farmer's
+    same crop, a different unit ("kg" vs "bundle"), a different crop, and the
+    supermarket's own warehouse records (those already merged separately).
+  • The farmer app now reconciles the server's response by record id after
+    posting (replacing the optimistic temporary card) — so My Crops shows
+    exactly one card immediately, and the admin's Crops section receives the
+    same single merged record from the backend.
+
+LEGACY BUILD NOTES (v4.8):
+
+
+FIXED 1 — BUYING FROM A FARMER NOW REALLY ADDS THE KILOGRAMS TO THE STOCKS MENU
+  The bug: the admin had 30 kg Calamansi in the Stocks menu, bought 30 kg more
+  from a farmer — and the Stocks menu still showed 30 kg. Two engine bugs
+  combined into a zero-sum shuffle:
+  • The admin's own purchase was fulfilled by the BUYER-order sourcing engine,
+    which sources WAREHOUSE-FIRST — so it deducted the admin's OWN 30 kg shelf
+    stock instead of the farmer's harvest, and the delivery step put the same
+    30 kg back. Net result: nothing changed, and the farmer's sold lot was
+    never consumed (30 kg invented out of thin air in the totals).
+  • The "stock added" exactly-once flag was set on a SHALLOW COPY of the
+    order, so it never stuck — every trigger (delivery confirm, server
+    restart backfill) added the same kilograms AGAIN (triple-stocked shelves).
+
+  The fix — procurement orders (admin buying from farmers) now have their own
+  fulfillment path:
+  • The farmer's lot is deducted the moment the order leaves 'pending' (the
+    farmer confirms the admin's purchase — the sale is committed).
+  • The bought kilograms join the central warehouse stock IMMEDIATELY at that
+    same moment: 30 kg in Stocks + buy 30 kg → Stocks shows 60 kg right away.
+    The transport chain ("Confirm Delivery & Stock Received in Supermarket")
+    stays as the visual delivery step but can no longer be the only moment
+    stock arrives — and its stock-add is now a no-op (no double add).
+  • The exactly-once flags are pinned on the REAL order row, so re-completing
+    the order, re-confirming the haul or restarting the server never re-adds.
+  • Cancelling a fulfilled procurement reverses BOTH moves exactly once: the
+    farmer's kilograms return to their lot and the warehouse addition is
+    subtracted back out (clamped at zero if already resold).
+
+FIXED 2 — FARMER SALES ONLY COUNT TRANSACTIONS THE ADMIN ACTUALLY COMPLETED
+  The farmer's Orders-tab date summary ("Total Sales — All Dates / a date")
+  counted every non-cancelled transaction, including requests the admin had
+  not bought or completed yet. The headline figure now counts ONLY completed
+  transactions, matching the Farmer dashboard's Total Sales. The in-progress
+  peso value stays visible as an informational line ("In Progress ₱… not yet
+  sales — admin has not completed the buy"), so no information is lost.
+
+ALSO SWEPT IN THIS BUILD (transaction integrity between all users)
+  • The transport-haul delivery sync and any procurement order that arrives
+    already past 'pending' now run the same correct fulfillment dispatcher.
+  • Buyer-order behavior is unchanged and re-verified: request ceiling is the
+    combined crop availability, nothing is deducted at submission, fulfillment
+    deducts warehouse-first then farmer lots, cancellation restocks exactly
+    what was taken.
+
+LEGACY BUILD NOTES (v4.7):
+
+
+FIXED — PURCHASE REQUESTS ARE NOW CHECKED AGAINST THE FULL COMBINED STOCK
+  The bug: requesting "60 kg Calamansi" from the Market cart was refused with
+  "Request blocked — Calamansi: requested 60kg, only 50kg on the shelf" even
+  though the Market showed 110 kg left (two farmers: 50 kg + 60 kg). The
+  availability check targeted the ONE listing record the cart item carried,
+  instead of the combined market stock.
+
+  The fix:
+  • Every buyer line is now validated against the TOTAL availability for that
+    crop — the warehouse shelf plus EVERY farmer's listed kilograms. The
+    ceiling now matches what the Admin can actually source (v4.6 fulfillment
+    already splits across warehouse + farmer lots), so 60 kg against a 110 kg
+    combined market is accepted, while 120 kg is still refused.
+  • Requests for a crop that exists nowhere on the platform still pass
+    through as custom sourcing requests for the Admin to decide (unchanged
+    legacy behavior).
+  • Client and server both use the same combined ceiling; the overselling
+    guard, the v4.6 no-deduction-at-submission rule and fulfillment-time
+    exactly-once deduction are unchanged.
+
+ALSO IN THIS BUILD
+  • Test suite hardening only (no app behavior change): the v4.2/v4.3/v4.4
+    e2e suites now create their own fixture products instead of depending on
+    leftover database rows, and the legacy below-floor seeded Ampalaya row
+    was reset to its DA-compliant price.
+
+LEGACY BUILD NOTES (v4.6):
+
+
+1. FIXED — SUBMITTING A PURCHASE REQUEST NO LONGER DEDUCTS FARMER STOCK
+   The bug: the moment a buyer submitted a purchase request from the Market
+   cart, the farmer's product quantity was deducted — even though the Admin
+   had not confirmed anything. (The market cart carried a farmer listing id,
+   which the checkout treated as a "direct purchase" and drained it on the
+   spot, on both the client and the server.)
+
+   The fix, matching the real VeggieConnect flow:
+   • The buyer ONLY ever submits a REQUEST. Submitting it deducts NOTHING —
+     the farmer's listing keeps its full kilograms until the Admin acts.
+   • The ADMIN confirms/fulfills the request → that is when the Admin buys
+     the farmer's product and resells to the buyer: stock is deducted exactly
+     once at the first fulfillment transition (warehouse shelf first, then
+     the farmer's actual lots via the multi-farmer split allocation), and the
+     sourcing allocations + admin profit are recorded on the order.
+   • Cancelling a STILL-PENDING request returns nothing (no kilo was ever
+     taken); cancelling a FULFILLED order still returns every kilo to the
+     exact farmer lot / warehouse shelf it came from.
+   • Availability checks (overselling guard) still run at submission — a
+     request above the combined market stock is still refused.
+
+2. BUYER CANCEL FLOW CLEANED UP (buyer is just a buyer)
+   • The confirmation modal is now titled "Cancel Order" (was "Cancel Order
+     & Restock") and the "Automatic Inventory Restock — cancelling this order
+     immediately returns all reserved kilograms back to the supermarket live
+     inventory" explainer box (per-item +N kg breakdown and "Total Restocked"
+     line) is REMOVED.
+   • The red "Confirm Cancellation & Restock Stock" button now just says
+     "Confirm Cancellation"; the Cancel button tooltip no longer mentions
+     restocking; the cancelled order chip reads "Cancelled" (was "Cancelled
+     & Restocked") and the "+N kg Restocked to Stock" badge is gone.
+
+LEGACY BUILD NOTES (v4.5):
+
+COMBINED "KG LEFT" IN THE BUYER'S MARKET WHEN FARMERS LIST THE SAME CROP
+  The buyer's Market menu shows ONE entry per crop (buyers browse and submit
+  purchase requests per crop). When several farmers list the same crop, that
+  entry now shows the COMBINED "kg left" of every farmer's available stock —
+  exactly the requested behavior: Farmer A lists 50 kg Calamansi and Farmer B
+  lists 50 kg Calamansi → the Market's Calamansi entry shows 100 kg (before
+  this build it showed only the best-stocked farmer's 50 kg and the second
+  farmer's lot was invisible).
+
+  Details:
+  • Each farmer's listing is still stored as its own record (per-farmer
+    prices, stock and dashboard stay independent); only the buyer-facing
+    market entry aggregates their availability.
+  • The displayed price/freshness/photo come from the best-stocked listing;
+    buyer prices stay DA-anchored, so they do not change with the mix.
+  • When one farmer sells out, the combined kg drops automatically (50+50
+    sold out on one side → 50 left), and when a third farmer lists the same
+    crop their kg adds in too.
+  • Fulfillment is unchanged and correct: the admin's sourcing plan still
+    allocates each buyer request across the individual farmer lots, so the
+    combined figure is always truly available.
+  • Catalog rules are untouched: admin/supermarket warehouse stock never
+    enters the Market, sold-out lots are hidden, and only crops owned by
+    registered farmer accounts surface. The aggregation now lives in
+    src/utils/marketCatalog.ts with its own unit tests.
+
+LEGACY BUILD NOTES (v4.4):
+
+DA SUGGESTED DIRECT PRICE IS NOW THE FLOOR FOR FARMER ASKING PRICES
+  A farmer can no longer set "Your Farm-gate Asking Price (₱ per kg)" below
+  the DA Suggested Direct price of the crop. Example from the request: Banana
+  (Lakatan) has a DA Suggested Direct price of ₱55/kg, so the minimum the
+  farmer can enter is ₱55 — in the "List Vegetable for Sale" form AND when
+  updating an existing product's price in "Edit Vegetable Listing".
+
+  How it works for the farmer:
+  • Typing a price below the floor turns the price field red and shows an
+    inline message, e.g. "Minimum ₱55.00/kg — the DA Suggested Direct price
+    for Banana (Lakatan). Your asking price cannot go below it."
+  • The List / Save button refuses to submit while the price is below the
+    floor. The DA guide card and the "Use Price" shortcut stay available.
+  • Crops the DA bulletin does not cover have no floor (any price allowed).
+  • A listing that was ALREADY below the floor before this build keeps its
+    stored price while untouched (other fields stay editable); the farmer
+    just cannot enter a NEW lower price, and any new input must reach the
+    floor or higher.
+
+  Enforced in three places, so it cannot be bypassed:
+  1. The farmer's form (live red field + blocked submit),
+  2. The server's product UPDATE endpoint — lowering below the floor is
+     rejected with a "DA price floor" error (raising to/above the floor is
+     always allowed; the "Match DA" button sends exactly the floor),
+  3. The server's product CREATE endpoint — a new listing below the floor is
+     rejected. Supermarket-owned warehouse stock is exempt (its retail price
+     is not a farmer asking price). The floor uses the exact same DA matcher
+     the farmer's form shows, so rule and display can never disagree.
+
+LEGACY BUILD NOTES (v4.3):
+
+FARMER PRICE CONTROL + FRESH ADMIN CROPS PRICES (two related fixes)
+  Root cause of both issues: the admin's Crops ▸ Farmer Offers (Buy Desk)
+  list displayed a legacy "farmgateAskingPrice" field that was captured when
+  the crop was FIRST listed and was NEVER updated when the farmer changed
+  their price — so the price per kg looked stuck on the old (often
+  DA-suggested) value, and raising it as a farmer appeared to do nothing.
+
+1. YOUR FARM-GATE ASKING PRICE NEVER FOLLOWS THE DA SUGGESTED DIRECT PRICE
+   The price the farmer types in "Your Farm-gate Asking Price (₱ per kg)" is
+   the ONLY thing that sets their asking price — the app never rewrites it
+   from the DA bulletin. The DA Price Guide card stays as a pure reference
+   (Suggested Direct + Wet Market, with the optional "Use Price" button the
+   farmer may click on purpose). Verified: after a DA Price Bulletin sync,
+   the farmer's asking price is untouched.
+
+2. FARMER PRICE UPDATES NOW SHOW UP IN THE ADMIN'S CROPS MENU
+   Every price change the farmer makes (Edit Vegetable Listing, or the
+   "Match DA" button on their dashboard) now updates BOTH price fields —
+   the current price AND the legacy farmgate field — in the app state, the
+   server memory and the MySQL database, in one atomic update. The admin's
+   Crops ▸ Farmer Offers list, the Buy Desk procurement modal, sourcing cost
+   computations and analytics now read the farmer's CURRENT price (falling
+   back to the legacy field only for old rows). Supermarket-owned warehouse
+   stock keeps its original procurement cost — farmer edits never touch it.
+   Existing listings whose price was edited before this build also display
+   correctly now (the current price wins), so no re-listing is needed.
+
+LEGACY BUILD NOTES (v4.2):
+
+NEW IN BUILD v4.2 (verified end-to-end against a real MySQL database — 8/8
+new checks + both v4.0/v4.1 regression suites passed, including restarts):
+
+₱100 BULK DISCOUNT — BUY 90 KG, SAVE ₱100
+  When ONE order reaches 90 kg of produce (any mix of products — quantities
+  add up), the buyer gets ₱100 off at checkout:
+  • Central Market cart: a "Bulk Discount (90 kg+)" line appears in the cost
+    breakdown — while below 90 kg it shows exactly how many more kg are
+    needed ("add 12 kg more for −₱100"); at 90 kg+ it shows −₱100.00 and the
+    Total Direct Payment drops.
+  • Request Crops modal: same line between "Total quantity" and "Estimated
+    total"; the submit button already shows the discounted total.
+  • Enforced on the SERVER as the source of truth — an order of 90 kg+
+    always pays ₱100 less even from an older client, and a client that
+    already applied it is never discounted twice.
+  • Receipts (buyer Orders view + admin receipt) show "Bulk Discount
+    (90 kg+): −₱100.00"; the admin's Preview Reports orders table gained a
+    "Disc." column.
+  • The platform absorbs the promo: farmer farmgate earnings are untouched;
+    the admin commission on the order drops by the ₱100 (never below zero).
+  • Admin procurement hauls are exempt; only kg items count (bunches/
+    bundles don't add toward the 90 kg).
+  • Bonus fix: the users.role database column now includes 'transporter',
+    so the sample Transporter 1 & 2 accounts no longer error on save —
+    their records persist properly in MySQL across restarts.
+
+LEGACY BUILD NOTES (v4.1):
+
+NEW IN BUILD v4.1 (verified end-to-end against a real MySQL database — 18/18
+new checks + 20/20 v4.0 regression checks passed, including a server restart):
+
+1. FORGOT PASSWORD NOW LIVES ON THE LOGIN PAGE (full user-side flow)
+   Login form → new "Forgot password?" link → a form where the user enters
+   the MOBILE NUMBER OR EMAIL on the account + THE LAST PASSWORD THEY KNOW
+   and presses "Request Password Reset". The server checks that last password
+   against the account BEFORE creating the request:
+   - wrong password → rejected immediately ("does not match our records"), no
+     request reaches the admin;
+   - correct password → a pending request is stored (MySQL table
+     password_reset_requests, survives restarts; repeated requests update the
+     same record instead of duplicating).
+   Requesting by phone number works too. Unknown contacts get a clear error.
+
+2. ADMIN NOTIFICATION: THE PW BUTTON TURNS RED
+   In the Admin Console → Users & KYC, the affected account's "PW" button
+   turns RED (pulsing, with a white dot) and a red banner above the list
+   names the requester(s). Opening the PW modal shows the verified request
+   ("Password reset requested from the login page — the server already
+   verified the last password · requested <date/time> · contact"). The admin
+   then sets the temporary password as before — doing so AUTOMATICALLY
+   resolves the request (badge clears). A "Dismiss request (no reset)"
+   button handles unnecessary requests. The inbox is polled every 5 s.
+
+3. RESET PASSWORD MODAL NOW USES THE EXACT APP SHELL
+   The "Reset Password · DA Admin Console" modal had its own height (h-auto)
+   and could overlap/float over the app frame. It now uses the identical
+   fixed phone shell as the Verification Review and Reports modals
+   (430 px wide, same height formula, 44 px rounding, bezel border), with a
+   pinned header and scrollable body — it always aligns with the app frame.
+
+4. NAMES AUTO-CAPITALIZE AT REGISTRATION
+   "juan dela cruz" is stored as "Juan Dela Cruz" — the first letter of every
+   lowercase word is capitalized in the details (applies to the person's name
+   AND the farm name, on the client for instant display and re-enforced on
+   the server, so the stored account is correct even offline).
+
+LEGACY BUILD NOTES (v4.0):
+
+1. FORGOT-PASSWORD FLOW (no email / SMS needed)
+   Users & KYC tab → every user row now has a "PW" (Reset Password) button.
+   The admin types a temporary password (min 6 chars, typed twice), the server
+   re-hashes it (same PBKDF2 scheme as signup) and updates MySQL + memory.
+   Hand the password to the user in person / over the phone.
+
+2. LOAD SAMPLE DATA — one click, demo-ready
+   Users & KYC tab → "Load Sample Data" button fills:
+   - 5 farmers (4 approved + Pedro Sumalpong pending, for the KYC demo)
+   - 5 buyers (4 approved + Karla Escobal pending, with ₱900–₱2,000 wallets)
+   - 10 produce listings with photos (tomato, eggplant, camote, sayote,
+     kangkong, spring onion, cabbage, carrots, squash, ampalaya)
+   - Transporter 1 (Tricycle JVE-1101) & Transporter 2 (Motorcycle KVG-2202)
+   ALL sample passwords: veggie123. Idempotent — pressing it twice never
+   duplicates anything. A "pending" farmer & buyer are included so the
+   verification queue has something to review in the demo.
+
+3. TRANSPORTER BUSY-UNTIL-COMPLETED RULE
+   A transporter (e.g. Transporter 1) who accepts a haul is BUSY until that
+   transaction is completed/cancelled — they cannot accept a second haul
+   meanwhile (server enforces it: 409 TRANSPORTER_BUSY, and the app shows the
+   message). With Transporter 1 busy, Transporter 2 takes the next order;
+   when the first transaction completes, Transporter 1 is available again.
+
+4. VERIFICATION AUDIT TRAIL
+   Approve / Reject now stamps WHO decided and WHEN (approved_at/by,
+   rejected_at/by — MySQL columns auto-added to existing XAMPP databases on
+   next start). The review modal stays open after the decision and shows the
+   receipt: "Approved by VeggieConnect Admin Desk · 11/15/2026, 9:41:00 PM".
+   Repeated profile syncs never rewrite the stamp; re-queueing clears it.
+
+5. REPORTS PREVIEW (in-app, no download)
+   Users & KYC tab → "Preview Reports" opens a phone-sized report screen:
+   pick "Registered Users" or "Orders", set a From/To date range (empty =
+   all time), and the filtered rows appear right inside the app with a
+   summary (count, farmers/buyers split, total order value in ₱) and an ✕
+   exit button (Esc works too). No CSV download, no libraries.
+
+LEGACY BUILD NOTES (v3.9):
+
+1. VERSION HANDSHAKE (CLIENT ↔ SERVER)
+   /api/health now reports the server build; the login screen and the Admin
+   Console compare it with their own build and show a red VERSION MISMATCH
+   banner when the running server process is older than the page. The stale
+   server can no longer hide behind a refreshed browser.
+
+2. REVIEW MODAL NOW SAYS WHY AN ID IS "MISSING"
+   - 404 on the document lookup → "The RUNNING app server is an older build —
+     restart it fully, then refresh. The uploaded ID is safe in the database."
+   - No image in the database → states whether XAMPP MySQL is connected and
+     that pre-documents legacy accounts simply have no stored document.
+   - Server unreachable → says so instead of silently showing "Missing".
+
+3. AUTO-RESTARTING DEV SERVER
+   `npm run dev` now runs `tsx watch server.ts` — extracting newer code into
+   the folder restarts the API automatically (no more stale-API trap).
+
+LEGACY BUILD NOTES (v3.8):
+
+1. PENDING USER VERIFICATION · DA ADMIN CONSOLE — SAME SIZE AS THE APP
+   The "View Documents" modal now renders in EXACTLY the same phone shell as
+   the app itself (430px width, same height, same rounded bezel) instead of
+   spanning the whole browser window. The header stays pinned on top, the
+   documents scroll in the middle, and Approve / Reject are pinned at the
+   bottom like an app screen.
+
+2. VALID GOVERNMENT ID NOW SHOWS FOR EVERY NEW REGISTRATION
+   Root cause fixed: the Valid ID photo was stored correctly at registration,
+   but the admin console only looked for it in its own browser's local
+   registry — so it showed "Missing" whenever the registry copy was
+   overwritten (user logged in again, the recurring users poll refreshed, or
+   the Admin reviewed from a different device). Now:
+   - New endpoint GET /api/users/:id/documents serves the uploaded Valid
+     Government ID, business proof and RSBSA straight from the database when
+     the review modal opens (any device, any browser).
+   - The login response and the startup server sync no longer drop the
+     document fields, so registry copies keep their images.
+   - The users-poll merge re-attaches documents it already knows instead of
+     wiping them.
+   Documents appear as the same 64×64 attached-document card used on the
+   registration form — the Admin sees the ID at the same size as the app.
+
+LEGACY BUILD NOTES (v3.4):
 
 1. BUYER WALLET — "VeggieConnect Pay" WITH DEPOSIT (PROTOTYPE)
    A new Wallet tab sits in the buyer's bottom navigation (and in Profile ▸

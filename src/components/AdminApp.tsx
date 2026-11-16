@@ -28,6 +28,7 @@ import {
   TrendingDown,
   Scale,
   BarChart2,
+  KeyRound,
   Minus,
   Info,
   Sliders,
@@ -65,11 +66,14 @@ import {
   IdCard,
   ShieldX,
 } from 'lucide-react';
-import { UserProfile, ProduceItem, Order, TransportJob, DirectMessage, DAPriceItem, DABulletinMeta, PriceAdjustmentQuote, VerificationStatus } from '../types';
+import { UserProfile, ProduceItem, Order, TransportJob, DirectMessage, DAPriceItem, DABulletinMeta, PriceAdjustmentQuote, VerificationStatus, orderItemAmount, orderPayable } from '../types';
 import { buildSourcingPlan, LOW_MARGIN_RATE } from '../utils/sourcing';
 import type { SourcingLot, SourcingPlanLine } from '../utils/sourcing';
 import { verificationStateOf, isVerificationPending } from '../utils/verification';
 import { VerificationReviewModal } from './VerificationReviewModal';
+import { AdminPasswordResetModal } from './AdminPasswordResetModal';
+import { ReportsPreviewModal } from './ReportsPreviewModal';
+import { CLIENT_BUILD, useServerBuild } from '../utils/buildInfo';
 import {
   getOrderDateKey,
   formatDateKeyLabel,
@@ -151,7 +155,11 @@ interface AdminAppProps {
     orderId: string,
     status: any,
     cancelReason?: string,
-    cancelledBy?: string
+    cancelledBy?: string,
+    /** Partial fulfillment: the order adjusted to the AVAILABLE quantities
+     *  (shortfall recorded as a buyer refund) — sent instead of the stale
+     *  order when the admin fulfils with insufficient stock. */
+    adjustedOrder?: Order
   ) => void;
   /** Admin availability ruling: mark one ordered product unavailable and
    *  return its amount to the buyer's wallet — the order itself continues. */
@@ -212,6 +220,40 @@ export const AdminApp: React.FC<AdminAppProps> = ({
 
   // Check if currently authenticated as admin
   const isAdminAuthenticated = currentUser && currentUser.role === 'admin';
+
+  // Build handshake: warn loudly when the RUNNING server process is an older
+  // build than this console (new UI + old API = documents silently missing).
+  const { serverBuild, mysqlConnected, mismatch } = useServerBuild();
+
+  // ── Admin tools state ─────────────────────────────────────────────────────
+  // Forgot-password flow: which user is getting a temporary password, plus the
+  // pending login-page reset requests (each lights that user's PW button red).
+  const [resetPwUser, setResetPwUser] = useState<UserProfile | null>(null);
+  const [pendingResetRequests, setPendingResetRequests] = useState<any[]>([]);
+  // One-click demo dataset + in-app reports preview.
+  const [seedBusy, setSeedBusy] = useState(false);
+  const [showReports, setShowReports] = useState(false);
+
+  // Poll the forgot-password request inbox (login page → admin console).
+  React.useEffect(() => {
+    let alive = true;
+    const load = () => {
+      fetch('/api/password-reset-requests')
+        .then((r) => (r.ok ? r.json() : []))
+        .then((d) => {
+          if (alive && Array.isArray(d)) {
+            setPendingResetRequests(d.filter((x: any) => x && x.status === 'pending'));
+          }
+        })
+        .catch(() => {});
+    };
+    load();
+    const t = setInterval(load, 5000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
 
   // Admin login form state (empty fields requiring manual entry)
   const [adminEmail, setAdminEmail] = useState('');
@@ -761,6 +803,11 @@ export const AdminApp: React.FC<AdminAppProps> = ({
     { name: string; unit: string; stockQuantity: number; linkedProduceIds: string[] } | null
   >(null);
   const [buyingProduceItem, setBuyingProduceItem] = useState<ProduceItem | null>(null);
+  // Partial fulfillment choice (v4.11): a buyer request whose stock falls
+  // short opens this modal — the admin may fulfil ONLY the available
+  // kilograms (the buyer is charged just for those; the shortfall is
+  // recorded as a refund) or back out to source more stock.
+  const [partialFulfillOrder, setPartialFulfillOrder] = useState<Order | null>(null);
   const [buyQty, setBuyQty] = useState<number>(0);
   const [produceSubTab, setProduceSubTab] = useState<'supermarket' | 'farmer_offers'>('farmer_offers');
 
@@ -1316,7 +1363,7 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                sm.id === `sm-${p.id}`)
           );
 
-          const cost = p.farmgateAskingPrice || p.pricePerUnit;
+          const cost = p.pricePerUnit || p.farmgateAskingPrice || 0;
           const qty = p.boughtQuantity || 1;
 
           list.push({
@@ -1369,7 +1416,7 @@ export const AdminApp: React.FC<AdminAppProps> = ({
         );
         if (!alreadyInList && !seenKeys.has(smKey)) {
           seenKeys.add(smKey);
-          const cost = p.farmgateAskingPrice || Math.round(p.pricePerUnit * 0.75);
+          const cost = p.pricePerUnit || p.farmgateAskingPrice || Math.round(p.pricePerUnit * 0.75);
           list.push({
             id: smKey,
             produceId: p.id,
@@ -2071,19 +2118,59 @@ export const AdminApp: React.FC<AdminAppProps> = ({
   // flag) which unlocks full app features; Reject keeps the account locked
   // out of selling / ordering.
   const handleVerificationDecision = (user: UserProfile, decision: VerificationStatus) => {
+    const nowIso = new Date().toISOString();
+    const decider = currentUser?.name || 'DA Admin';
     const updated: UserProfile = {
       ...user,
       verificationStatus: decision,
       verified: decision === 'Approved',
     };
+    // Audit trail stamps (client twin of the server's own stamping so the
+    // "Approved by … · date" receipt appears instantly in the open modal).
+    if (decision === 'Approved') {
+      updated.approvedAt = nowIso;
+      updated.approvedBy = decider;
+      updated.rejectedAt = undefined;
+      updated.rejectedBy = undefined;
+    } else if (decision === 'Rejected') {
+      updated.rejectedAt = nowIso;
+      updated.rejectedBy = decider;
+      updated.approvedAt = undefined;
+      updated.approvedBy = undefined;
+    }
+    (updated as any).verificationDecisionBy = decider;
     onUpdateUser(updated);
     appSync.publish('USERS_UPDATED', updated, 'admin');
-    setVerificationUser(null);
+    // Keep the modal open as a receipt: the Admin sees the approved/rejected
+    // badge plus the audit line, then closes with ✕ or Esc.
+    setVerificationUser(updated);
     showToast(
       decision === 'Approved'
         ? `${user.name} approved — they can now log in and trade`
         : `${user.name}'s registration was rejected — they cannot log in`
     );
+  };
+
+  // ── One-click demo dataset (Users & KYC tab button) ───────────────────────
+  const handleSeedSampleData = async () => {
+    if (seedBusy) return;
+    setSeedBusy(true);
+    try {
+      const resp = await fetch('/api/admin/seed-sample-data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok || !data?.success) {
+        showToast(`⚠️ ${data?.error || 'Could not load sample data — is the server running?'}`);
+      } else {
+        showToast(`🌱 ${data.message}`);
+      }
+    } catch (e) {
+      showToast('⚠️ Could not reach the app server — check that the app is running.');
+    }
+    setSeedBusy(false);
   };
 
   const handleSaveUserEdit = (e: React.FormEvent) => {
@@ -2227,7 +2314,7 @@ export const AdminApp: React.FC<AdminAppProps> = ({
           .map((p) => ({
             id: p.id,
             cropName: p.name || name,
-            farmgatePrice: Number(p.farmgateAskingPrice ?? p.pricePerUnit) || 0,
+            farmgatePrice: Number(p.pricePerUnit ?? p.farmgateAskingPrice) || 0,
             availableQty: Math.floor(Number(p.stockQuantity) || 0),
             farmerId: p.farmerId,
             farmerName: p.farmerName,
@@ -2293,9 +2380,20 @@ export const AdminApp: React.FC<AdminAppProps> = ({
       return;
     }
     if (sourcing.hasLots && sourcing.shortfallQty > 0) {
-      showToast(
-        `⚠️ Cannot fulfil #${order.id} — market shelf + farmer listings cover ${sourcing.lines.reduce((s, l) => s + l.plan.totalQty, 0)} kg but the request needs more (short by ${sourcing.shortfallQty} kg). Source more stock or mark the item unavailable.`
-      );
+      // v4.11: insufficient stock BLOCKS automatic fulfillment — but the
+      // admin now gets the CHOICE to fulfil partially: only the available
+      // kilograms are delivered and the buyer is charged ONLY for those
+      // (the shortfall is recorded as a refund, exactly like the per-line
+      // "Mark Unavailable" ruling). With NOTHING available the only honest
+      // option is to source stock or mark the items unavailable.
+      const fulfillableQty = sourcing.lines.reduce((s, l) => s + l.plan.totalQty, 0);
+      if (fulfillableQty <= 0) {
+        showToast(
+          `⚠️ Cannot fulfil #${order.id} — nothing is available for the requested products (needs ${sourcing.lines.reduce((s, l) => s + Number(l.item.quantity) || 0, 0)} kg). Source more stock or mark the items unavailable.`
+        );
+        return;
+      }
+      setPartialFulfillOrder(order);
       return;
     }
 
@@ -2311,6 +2409,93 @@ export const AdminApp: React.FC<AdminAppProps> = ({
       sourcing.hasLots && sourcing.weightedAvgSourcingCost > 0
         ? `✅ Fulfilled #${order.id} — sourcing cost ₱${sourcing.totalFarmerCost.toFixed(2)} (avg ₱${sourcing.weightedAvgSourcingCost.toFixed(2)}/kg), net profit ₱${sourcing.netAdminProfit.toFixed(2)}.`
         : `✅ Fulfilled Buyer Request #${order.id}! Warehouse stocks deducted & Buyer notified.`
+    );
+  };
+
+  // ── Partial fulfillment (v4.11) ────────────────────────────────────────────
+  // The admin may fulfil a buyer request even when stock falls short of the
+  // requested quantity — but the buyer is then charged ONLY for the products
+  // they actually receive. The order is adjusted to the AVAILABLE quantities:
+  // request-lot lines are cut to what the sourcing plan can cover, lines with
+  // nothing available become 'unavailable' rulings (the same per-line refund
+  // as the "Mark Unavailable" button), and the shortfall money is recorded in
+  // refundedTotal — credited to the buyer's wallet when the order is already
+  // paid, simply dropped from the bill when it is not.
+  const buildPartialFulfillment = (order: Order) => {
+    const sourcing = computeOrderSourcing(order);
+    const wasPaid = order.paymentStatus === 'paid';
+    const ruledAt = new Date().toISOString();
+    let shortfallAmount = 0;
+    let shortfallKg = 0;
+
+    const adjustedItems = (order.items || []).map((it) => {
+      const line = sourcing.lines.find((l) => l.item === it);
+      if (!line) return it; // direct-basket line — deducted at POST, always available
+      const available = Math.max(0, Math.floor(line.plan.totalQty));
+      const requested = Number(it.quantity) || 0;
+      const unitPrice = Number(it.unitPrice ?? it.pricePerUnit) || 0;
+      if (available >= requested) return it; // fully coverable — untouched
+      const lostQty = Math.max(0, requested - available);
+      const lostAmount = Math.round(lostQty * unitPrice * 100) / 100;
+      shortfallAmount = Math.round((shortfallAmount + lostAmount) * 100) / 100;
+      shortfallKg += lostQty;
+      if (available <= 0) {
+        return {
+          ...it,
+          itemStatus: 'unavailable' as const,
+          refundedAmount: lostAmount,
+          refundedAt: ruledAt,
+        };
+      }
+      return {
+        ...it,
+        originalQuantity: requested,
+        shortfallKg: lostQty,
+        quantity: available,
+        refundedAmount: lostAmount,
+        refundedAt: ruledAt,
+      };
+    });
+
+    const adjustedOrder: Order = {
+      ...order,
+      items: adjustedItems,
+      refundedTotal: Math.round(((Number(order.refundedTotal) || 0) + shortfallAmount) * 100) / 100,
+      ...(wasPaid
+        ? { refundedCredited: Math.round(((Number(order.refundedCredited) || 0) + shortfallAmount) * 100) / 100 }
+        : {}),
+      partialFulfilled: true,
+      partialFulfilledAt: ruledAt,
+      notes: `${order.notes ? order.notes + ' | ' : ''}Partially fulfilled (insufficient stock): buyer charged only for the available products${
+        shortfallKg > 0 ? ` — ${shortfallKg} kg short, ₱${shortfallAmount.toFixed(2)} returned` : ''
+      }.`,
+    };
+
+    // What the buyer now owes: delivered lines + delivery fee − discounts.
+    const deliveredAmount = adjustedItems.reduce(
+      (s, it) => s + (it.itemStatus === 'unavailable' ? 0 : orderItemAmount(it)),
+      0
+    );
+    const newPayable = Math.max(
+      0,
+      Math.round(
+        (deliveredAmount + (Number(order.deliveryFee) || 0) - (Number(order.bulkDiscount) || 0)) * 100
+      ) / 100
+    );
+    return { adjustedOrder, newPayable, shortfallAmount, shortfallKg, sourcing };
+  };
+
+  const confirmPartialFulfillment = () => {
+    if (!partialFulfillOrder) return;
+    const { adjustedOrder, newPayable, shortfallAmount, shortfallKg } = buildPartialFulfillment(partialFulfillOrder);
+    if (onUpdateOrderStatus) {
+      onUpdateOrderStatus(partialFulfillOrder.id, 'confirmed', undefined, undefined, adjustedOrder);
+    }
+    setPartialFulfillOrder(null);
+    showToast(
+      `✅ Fulfilled #${partialFulfillOrder.id} partially — buyer charged ₱${newPayable.toFixed(2)} for the available products${
+        shortfallKg > 0 ? ` (₱${shortfallAmount.toFixed(2)} for ${shortfallKg} kg returned${partialFulfillOrder.paymentStatus === 'paid' ? ' to their wallet' : ' removed from the bill'})` : ''
+      }.`
     );
   };
 
@@ -2866,6 +3051,39 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                   <div>
                     <h3 className="text-xs font-bold text-neutral-900">User Accounts & KYC</h3>
                     <p className="text-[10px] text-neutral-500">Manage growers, buyers, and active permissions</p>
+                    <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={handleSeedSampleData}
+                        disabled={seedBusy}
+                        className="px-2.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-[10px] font-black flex items-center gap-1 cursor-pointer transition-colors"
+                        title="Load 5 farmers, 5 buyers, 10 produce listings and Transporter 1 & 2 (password: veggie123)"
+                      >
+                        <Database className="w-3 h-3" />
+                        {seedBusy ? 'Loading…' : 'Load Sample Data'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowReports(true)}
+                        className="px-2.5 py-1.5 rounded-xl bg-white border border-neutral-200 hover:bg-neutral-50 text-neutral-700 text-[10px] font-black flex items-center gap-1 cursor-pointer transition-colors"
+                        title="Preview Registered Users / Orders reports with a date range — right inside the app"
+                      >
+                        <BarChart2 className="w-3 h-3" />
+                        Preview Reports
+                      </button>
+                    </div>
+                    {pendingResetRequests.length > 0 && (
+                      <div className="mt-2 rounded-xl border border-rose-300 bg-rose-50 px-2.5 py-1.5 text-[10px] font-bold text-rose-700 flex items-center gap-1.5 flex-wrap">
+                        <KeyRound className="w-3 h-3 flex-shrink-0" />
+                        <span>
+                          {pendingResetRequests.length === 1
+                            ? 'Password reset requested by'
+                            : 'Password reset requests from'}{' '}
+                          {pendingResetRequests.map((r: any) => r.userName).join(', ')} — their PW
+                          button is red; open it to set a temporary password.
+                        </span>
+                      </div>
+                    )}
                   </div>
 
                   {/* ── PENDING USER VERIFICATIONS (DA Admin queue) ── */}
@@ -2894,6 +3112,14 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                     <p className="text-[10px] text-neutral-600">
                       New Farmer &amp; Buyer registrations awaiting DA approval — the Admin reviews their documents (Valid Government ID, RSBSA / Business Proof) before they can log in.
                     </p>
+
+                    {mismatch && (
+                      <div className="rounded-2xl border border-red-300 bg-red-50 p-3 text-[10px] font-bold text-red-700">
+                        VERSION MISMATCH — this console is Build {CLIENT_BUILD} but the RUNNING app server is {serverBuild || 'unknown'}.
+                        Fully stop the app (Ctrl+C), start it again from the newest code folder, then hard-refresh (Ctrl+Shift+R).
+                        Until you restart, the Valid Government ID document lookup will NOT work and every review will show "Missing".
+                      </div>
+                    )}
 
                     {pendingVerifications.length === 0 ? (
                       <div className="rounded-2xl border border-dashed border-neutral-300 bg-white p-4 text-center text-[11px] text-neutral-500">
@@ -3229,6 +3455,32 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                               </div>
 
                               <div className="flex items-center gap-1">
+                                {(() => {
+                                  // A pending login-page reset request turns this
+                                  // account's PW button RED so the admin can't miss it.
+                                  const resetReq = pendingResetRequests.find(
+                                    (r: any) => r.userId === u.id && r.status === 'pending'
+                                  );
+                                  return (
+                                    <button
+                                      onClick={() => setResetPwUser(u)}
+                                      className={
+                                        resetReq
+                                          ? 'p-1.5 rounded-lg bg-rose-600 hover:bg-rose-700 text-white border border-rose-600 cursor-pointer flex items-center gap-1 text-[11px] font-black animate-pulse shadow-sm'
+                                          : 'p-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-700 border border-amber-200 cursor-pointer flex items-center gap-1 text-[11px] font-bold'
+                                      }
+                                      title={
+                                        resetReq
+                                          ? 'Password reset requested from the login page (last password verified) — open to set a temporary password'
+                                          : 'Reset Password — the forgot-password flow (admin sets a temporary password)'
+                                      }
+                                    >
+                                      <KeyRound className="w-3.5 h-3.5" />
+                                      <span>PW</span>
+                                      {resetReq && <span className="w-1.5 h-1.5 rounded-full bg-white" />}
+                                    </button>
+                                  );
+                                })()}
                                 <button
                                   onClick={() => setEditingUser(u)}
                                   className="p-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 cursor-pointer flex items-center gap-1 text-[11px] font-bold"
@@ -3299,7 +3551,10 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                         farmerOffersList.map((p) => {
                             const isFullyProcured = p.stockQuantity === 0;
                             const isPartiallyProcured = (p.boughtQuantity || 0) > 0 && p.stockQuantity > 0;
-                            const askingPrice = p.farmgateAskingPrice || p.pricePerUnit;
+                            // Show the farmer's CURRENT price — pricePerUnit is
+                            // what they last set; farmgateAskingPrice is only a
+                            // fallback for legacy rows.
+                            const askingPrice = p.pricePerUnit || p.farmgateAskingPrice;
 
                             return (
                               <div key={p.id} className="bg-white border border-neutral-200 rounded-3xl p-3.5 space-y-2.5 shadow-xs">
@@ -3969,7 +4224,13 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                                   <span className={`w-2 h-2 rounded-full ${isAvailable ? 'bg-emerald-500' : 'bg-amber-500'}`} />
                                                   <div>
                                                     <span className="font-bold text-neutral-900">{item.produceName}</span>
-                                                    <span className="text-[10px] text-neutral-500 ml-1 font-mono">
+                                                    <span
+                                                      className={`text-[10px] ml-1 font-bold px-1.5 py-0.5 rounded-full whitespace-nowrap ${
+                                                        isAvailable
+                                                          ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                                                          : 'bg-amber-100 text-amber-700 border border-amber-200'
+                                                      }`}
+                                                    >
                                                       ({item.quantity} {item.unit}s requested)
                                                     </span>
                                                   </div>
@@ -4036,7 +4297,7 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                                                       title="Mark unavailable: return this product's amount to the buyer — the order continues with the remaining products"
                                                     >
                                                       <AlertTriangle className="w-3 h-3" />
-                                                      <span>Mark Unavailable & Return Amount</span>
+                                                      <span>Mark Unavailable</span>
                                                     </button>
                                                   </div>
                                                 )
@@ -5874,6 +6135,12 @@ export const AdminApp: React.FC<AdminAppProps> = ({
                   <span>Delivery Fee</span>
                   <span>₱{(Number(selectedReceiptData.order.deliveryFee) || 0).toFixed(2)}</span>
                 </div>
+                {(Number(selectedReceiptData.order.bulkDiscount) || 0) > 0 && (
+                  <div className="flex justify-between text-emerald-700 font-bold">
+                    <span>Bulk Discount (90 kg+)</span>
+                    <span>−₱{Number(selectedReceiptData.order.bulkDiscount).toFixed(2)}</span>
+                  </div>
+                )}
                 <div className="flex justify-between text-sm font-black text-emerald-950 pt-1 border-t border-neutral-200">
                   <span>Total Amount Paid</span>
                   <span className="text-emerald-700">₱{(Number(selectedReceiptData.order.totalAmount ?? selectedReceiptData.order.subtotal) || 0).toFixed(2)}</span>
@@ -6027,7 +6294,137 @@ export const AdminApp: React.FC<AdminAppProps> = ({
         onReject={(u) => handleVerificationDecision(u, 'Rejected')}
       />
 
+      {/* Admin password reset — the prototype's forgot-password flow */}
+      {resetPwUser && (
+        <AdminPasswordResetModal
+          user={resetPwUser}
+          pendingRequest={
+            pendingResetRequests.find(
+              (r: any) => r.userId === resetPwUser.id && r.status === 'pending'
+            ) || null
+          }
+          onClose={() => setResetPwUser(null)}
+          onDismissRequest={async (requestId) => {
+            try {
+              await fetch(`/api/password-reset-requests/${requestId}`, { method: 'DELETE' });
+            } catch (e) {
+              /* the poll will reconcile the list anyway */
+            }
+            setPendingResetRequests((prev) => prev.filter((r: any) => r.id !== requestId));
+            setResetPwUser(null);
+            showToast('Password reset request dismissed — the account is unchanged.');
+          }}
+          onDone={(msg) => {
+            setResetPwUser(null);
+            setPendingResetRequests((prev) => prev.filter((r: any) => r.userId !== resetPwUser.id));
+            showToast(`🔑 ${msg}`);
+          }}
+        />
+      )}
+
+      {/* Reports preview — date-filtered, in-app, no download needed */}
+      {showReports && (
+        <ReportsPreviewModal
+          users={registeredUsers}
+          orders={orders}
+          onClose={() => setShowReports(false)}
+        />
+      )}
+
       {/* Buy Produce from Farmer Modal (shelving happens later via Put in Stock) */}
+      {/* Partial Fulfillment Modal (v4.11): stock falls short of a buyer
+          request — the admin chooses to fulfil ONLY the available products
+          (buyer charged accordingly) or back out and source more stock. */}
+      {partialFulfillOrder && (() => {
+        const plan = buildPartialFulfillment(partialFulfillOrder);
+        const wasPaid = partialFulfillOrder.paymentStatus === 'paid';
+        return (
+          <div className="absolute inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-white rounded-3xl p-5 max-w-sm w-full space-y-3.5 shadow-2xl border border-amber-200 animate-in fade-in zoom-in-95 duration-150">
+              <div className="flex items-center justify-between border-b border-amber-100 pb-2.5">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-xl bg-amber-100 flex items-center justify-center">
+                    <AlertTriangle className="w-4 h-4 text-amber-700" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-sm text-neutral-900">Insufficient Stock</h3>
+                    <p className="text-[10px] text-amber-700">Request #{partialFulfillOrder.id} — choose how to proceed</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setPartialFulfillOrder(null)}
+                  className="p-1 rounded-full hover:bg-neutral-100 cursor-pointer"
+                >
+                  <X className="w-4 h-4 text-neutral-500" />
+                </button>
+              </div>
+
+              <p className="text-[11px] text-neutral-600 leading-relaxed">
+                The warehouse and farmer listings do not cover the full request. You can fulfil
+                <strong> only the available products</strong> — the buyer is charged just for those, and the
+                shortfall is returned{wasPaid ? ' to their wallet' : ' removed from the bill'}.
+              </p>
+
+              <div className="space-y-1.5">
+                {plan.sourcing.lines.map(({ item, plan: line }) => {
+                  const available = Math.min(Number(item.quantity) || 0, Math.floor(line.totalQty));
+                  return (
+                    <div key={`${item.produceId}-${item.produceName}`} className="flex items-center justify-between bg-neutral-50 rounded-xl px-3 py-2">
+                      <div>
+                        <span className="text-[11px] font-bold text-neutral-800">{item.produceName}</span>
+                        <span className="text-[10px] text-neutral-500 block">
+                          {available} of {Number(item.quantity)} {item.unit || 'kg'} available · ₱{(Number(item.unitPrice ?? item.pricePerUnit) || 0).toFixed(2)}/{item.unit || 'kg'}
+                        </span>
+                      </div>
+                      <span className={`text-[10px] font-black px-2 py-0.5 rounded-full ${available <= 0 ? 'bg-red-100 text-red-700' : available < (Number(item.quantity) || 0) ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                        {available <= 0 ? 'NONE' : available < (Number(item.quantity) || 0) ? 'PARTIAL' : 'FULL'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-3 py-2.5 space-y-1">
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-neutral-600 font-bold">Buyer was to pay</span>
+                  <span className="text-neutral-500 font-bold line-through">₱{orderPayable(partialFulfillOrder).toFixed(2)}</span>
+                </div>
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-emerald-800 font-black">Buyer pays now (available only)</span>
+                  <span className="text-emerald-800 font-black">₱{plan.newPayable.toFixed(2)}</span>
+                </div>
+                {plan.shortfallAmount > 0 && (
+                  <div className="flex justify-between text-[10px]">
+                    <span className="text-neutral-500 font-bold">
+                      Short {plan.shortfallKg} kg — {wasPaid ? 'refunded to wallet' : 'removed from bill'}
+                    </span>
+                    <span className="text-red-600 font-black">−₱{plan.shortfallAmount.toFixed(2)}</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setPartialFulfillOrder(null)}
+                  className="flex-1 py-2.5 bg-neutral-100 hover:bg-neutral-200 text-neutral-700 font-extrabold rounded-2xl text-[11px] cursor-pointer active:scale-95 transition-all"
+                >
+                  Cancel — Source More Stock
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmPartialFulfillment}
+                  className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold rounded-2xl text-[11px] shadow-md cursor-pointer flex items-center justify-center gap-1.5 active:scale-95 transition-all"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Fulfil Available (₱{plan.newPayable.toFixed(2)})</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {buyingProduceItem && (
         <div className="absolute inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-3xl p-5 max-w-sm w-full space-y-3.5 shadow-2xl border border-emerald-200 animate-in fade-in zoom-in-95 duration-150">
@@ -6060,7 +6457,7 @@ export const AdminApp: React.FC<AdminAppProps> = ({
               <div className="pt-1 flex justify-between text-[11px] border-t border-emerald-200/70 text-emerald-900">
                 <span>Farmer Asking Price:</span>
                 <strong className="text-amber-800 font-black">
-                  ₱{(Number(buyingProduceItem.farmgateAskingPrice || buyingProduceItem.pricePerUnit) || 0).toFixed(2)}/kg
+                  ₱{(Number(buyingProduceItem.pricePerUnit || buyingProduceItem.farmgateAskingPrice) || 0).toFixed(2)}/kg
                 </strong>
               </div>
             </div>

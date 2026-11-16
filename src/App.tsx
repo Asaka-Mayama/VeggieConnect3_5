@@ -25,6 +25,8 @@ import { SUPERMARKET_STORAGE_KEY, ADMIN_HUB_STORAGE_KEY } from './utils/farmRout
 import { appSync } from './utils/appSync';
 import { setThemeRole } from './utils/themeStore';
 import { isVerificationPending, isVerificationRejected } from './utils/verification';
+import { purgeRegisteredIdentity } from './utils/registeredUsers';
+import { buildBuyerMarketCatalog } from './utils/marketCatalog';
 import { INITIAL_PRODUCE, INITIAL_FARMERS, INITIAL_ORDERS, INITIAL_TRANSPORT_JOBS } from './data/mockData';
 import { ProduceItem, FarmerProfile, CartItem, Order, OrderItem, DirectMessage, UserRole, OrderStatus, TransportJob, UserProfile, WalletTransaction, PriceAdjustmentQuote, isLiveSupermarketStock, orderItemAmount, orderPayable } from './types';
 import { MIN_PRODUCT_KG } from './components/ProduceCard';
@@ -80,17 +82,30 @@ function enrichUsersWithKnownPins(
   });
   return remoteUsers.map((u) => {
     if (!u) return u;
-    if (typeof u.latitude === 'number' && typeof u.longitude === 'number') return u;
+    // Verification documents (Valid Government ID, business proof, RSBSA) are
+    // stored server-side but are NOT shipped by the directory endpoints —
+    // /api/users/:id/documents serves them lazily to the review modal. When
+    // this browser still holds the copy from registration day, re-attach it
+    // so the recurring /api/users poll never wipes the registry's documents.
     const known = knownById.get(u.id);
+    const merged: UserProfile = { ...u };
+    if (known) {
+      if (!merged.validIdImage && known.validIdImage) merged.validIdImage = known.validIdImage;
+      if (!merged.businessProofImage && known.businessProofImage) merged.businessProofImage = known.businessProofImage;
+      if (!merged.rsbsaNumber && known.rsbsaNumber) merged.rsbsaNumber = known.rsbsaNumber;
+      if (!merged.verificationStatus && known.verificationStatus) merged.verificationStatus = known.verificationStatus;
+      if (!merged.submittedAt && known.submittedAt) merged.submittedAt = known.submittedAt;
+    }
+    if (typeof merged.latitude === 'number' && typeof merged.longitude === 'number') return merged;
     if (
       known &&
       typeof known.latitude === 'number' &&
       typeof known.longitude === 'number'
     ) {
-      return { ...u, latitude: known.latitude, longitude: known.longitude };
+      return { ...merged, latitude: known.latitude, longitude: known.longitude };
     }
-    const c = resolveCoordinates(u.location, u.latitude, u.longitude);
-    return { ...u, latitude: c.lat, longitude: c.lng };
+    const c = resolveCoordinates(merged.location, merged.latitude, merged.longitude);
+    return { ...merged, latitude: c.lat, longitude: c.lng };
   });
 }
 
@@ -1506,21 +1521,7 @@ export default function App() {
 
   // Order Handlers
   const handleOrderPlaced = (newOrder: Order) => {
-    // ── Warehouse-first stock target resolution ────────────────────────────
-    // Buyer purchases are fulfilled from the ADMIN's warehouse shelf — the
-    // supermarket-owned records the Stocks menu displays. Validation and the
-    // visual deduction therefore target the highest-stock WAREHOUSE record
-    // matching the crop name; the farmer's original listing is never consumed
-    // by a buyer sale (it remains the admin's future sourcing pool). When the
-    // admin holds no warehouse record for the crop at all, the item's own
-    // produce record (exact id) is the target.
-    const isWarehouseOwnedRecord = (p: ProduceItem) =>
-      p.sellerStoreName === 'VeggieConnect Supermarket' ||
-      p.sellerStatus === 'bought_and_stocked' ||
-      p.farmName === 'VeggieConnect Supermarket' ||
-      p.farmerName === 'VeggieConnect Central Produce Hub' ||
-      p.farmerId === 'admin-main' ||
-      (typeof p.id === 'string' && p.id.startsWith('sm-'));
+    // Crop-name normalization shared by the request validation below.
     const cropNamesMatch = (productName: any, requested: string) => {
       const a = String(productName || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
       const b = String(requested || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim();
@@ -1529,45 +1530,27 @@ export default function App() {
     };
     const stockOfProd = (p: ProduceItem) =>
       typeof p.stockQuantity === 'number' ? p.stockQuantity : parseInt(String(p.stockQuantity), 10) || 0;
-    const resolveTarget = (it: OrderItem): ProduceItem | undefined => {
-      const requestedName = (it.produceName || '').trim();
-      const warehouseTarget = produceList
-        .filter((p) => isWarehouseOwnedRecord(p) && cropNamesMatch(p.name, requestedName))
-        .sort((a, b) => stockOfProd(b) - stockOfProd(a))[0];
-      if (warehouseTarget) return warehouseTarget;
-      const byId = produceList.find((p) => p.id === it.produceId);
-      if (byId) return byId;
-      return produceList.find(
-        (p) => (p.name || '').trim().toLowerCase() === requestedName.toLowerCase()
-      );
-    };
 
     // ── Stock Validation (client choke point) ──────────────────────────────
-    // Direct basket items must fit within their resolved target shelf stock.
-    // REQUEST lots ("req-prod-*", Cart ▸ Request Crops) may exceed a single
-    // shelf record — the Admin fulfils them with the multi-farmer split
-    // allocation (warehouse first, then farmer harvests cheapest-first), so
-    // their ceiling is the TOTAL availability for that crop.
+    // EVERY buyer line is validated against the TOTAL availability for that
+    // crop — the warehouse shelf plus every farmer's listed kilograms. The
+    // Market shows one combined entry per crop (v4.5), the Admin fulfils with
+    // the multi-farmer split allocation (warehouse first, then farmer
+    // harvests cheapest-first, v4.6), so the ceiling must be the combined
+    // figure too. Validating a market-cart line against only its base
+    // listing's record used to block requests like "60 kg Calamansi" even
+    // though two farmers together had 110 kg on the market (v4.7 fix).
     const stockProblems: string[] = [];
     for (const it of newOrder.items) {
-      const isRequestLot = !it.produceId || String(it.produceId).startsWith('req-prod-');
-      if (isRequestLot) {
-        const requestedName = String(it.produceName || '').trim();
-        const totalAvailability = produceList
-          .filter((p) => (stockOfProd(p) || 0) > 0 && cropNamesMatch(p.name, requestedName))
-          .reduce((s, p) => s + stockOfProd(p), 0);
-        if ((it.quantity || 0) > totalAvailability) {
-          stockProblems.push(
-            `${it.produceName}: requested ${it.quantity}${it.unit || 'kg'}, only ${totalAvailability}${it.unit || 'kg'} available across the market and farmer listings`
-          );
-        }
-        continue;
-      }
-      const prod = resolveTarget(it);
-      if (!prod) continue;
-      const stock = stockOfProd(prod);
-      if ((it.quantity || 0) > stock) {
-        stockProblems.push(`${it.produceName}: requested ${it.quantity}${it.unit || 'kg'}, only ${stock}${prod.unit || 'kg'} on the shelf`);
+      const requestedName = String(it.produceName || '').trim();
+      if (!requestedName) continue;
+      const totalAvailability = produceList
+        .filter((p) => (stockOfProd(p) || 0) > 0 && cropNamesMatch(p.name, requestedName))
+        .reduce((s, p) => s + stockOfProd(p), 0);
+      if ((it.quantity || 0) > totalAvailability) {
+        stockProblems.push(
+          `${it.produceName}: requested ${it.quantity}${it.unit || 'kg'}, only ${totalAvailability}${it.unit || 'kg'} available across the market and farmer listings`
+        );
       }
     }
     if (stockProblems.length > 0) {
@@ -1575,28 +1558,14 @@ export default function App() {
       return;
     }
 
-    // Deduction plan: exactly ONE produce record per DIRECT ordered item
-    // (running stock so repeated crops in one order never over-deduct).
-    // REQUEST lots deduct ONLY at fulfillment (multi-farmer allocation),
-    // never at request time.
-    const deductionPlan = new Map<string, { newStock: number; originalStock: number }>();
-    {
-      const running = new Map<string, number>(produceList.map((p) => [p.id, stockOfProd(p)]));
-      for (const it of newOrder.items) {
-        if (!it.produceId || String(it.produceId).startsWith('req-prod-')) continue;
-        const target = resolveTarget(it);
-        if (!target) continue;
-        const prevStock = running.get(target.id) ?? stockOfProd(target);
-        const nextStock = Math.max(0, prevStock - (it.quantity || 0));
-        running.set(target.id, nextStock);
-        if (!deductionPlan.has(target.id)) {
-          deductionPlan.set(target.id, { newStock: nextStock, originalStock: prevStock });
-        } else {
-          deductionPlan.get(target.id)!.newStock = nextStock;
-        }
-      }
-    }
-
+    // NO stock deduction at request time. A buyer submission is a PURCHASE
+    // REQUEST (status 'pending'): the Admin confirms it, buys the farmer's
+    // product and resells it to the buyer. Farmer/warehouse stock is deducted
+    // exactly once when the order FIRST leaves 'pending' — the server's
+    // PUT /api/orders/:id fulfillment path (deductRequestLotsForOrder) does
+    // the authoritative deduction. Deducting here used to drain the farmer's
+    // listing the moment the buyer pressed submit, before the Admin even
+    // looked at the request (v4.6 bug fix).
     const generatedJobId = `TJ-${Date.now().toString().slice(-4)}`;
     const orderPayload = {
       ...newOrder,
@@ -1605,35 +1574,10 @@ export default function App() {
 
     setOrders((prev) => [orderPayload, ...prev]);
 
-    // Deduct purchased crop stock locally (visual only) — the server
-    // POST /api/orders performs the authoritative deduction with the same
-    // warehouse-first resolution, so the client no longer needs to PUT the
-    // deducted stock back (that used to double-deduct for cart orders).
-    if (deductionPlan.size > 0) {
-      setProduceList((prev) => {
-        const updated = prev.map((prod) => {
-          const plan = deductionPlan.get(prod.id);
-          if (plan) {
-            return {
-              ...prod,
-              stockQuantity: plan.newStock,
-              sellerStatus:
-                plan.newStock === 0 && !prod.sellerStoreName
-                  ? ('sold_out' as const)
-                  : prod.sellerStatus,
-            };
-          }
-          return prod;
-        });
-        localStorage.setItem(STORAGE_KEYS.PRODUCE, JSON.stringify(updated));
-        return updated;
-      });
-    }
-
-    // Send to backend API — the server re-validates stock against the
-    // latest shelf state so two buyers requesting the same remaining stock
-    // simultaneously can never oversell it. On rejection the local order
-    // and stock deduction are reverted.
+    // Send to backend API — the server re-validates availability (overselling
+    // guard) but deducts NOTHING at request time. On rejection the local
+    // request row is removed; no stock restore is needed because no stock
+    // was ever taken.
     fetch('/api/orders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1643,27 +1587,7 @@ export default function App() {
         if (!res.ok) {
           const data = await res.json().catch(() => null);
           const msg = data?.error || `Server rejected order ${orderPayload.id}`;
-          // Revert: remove the local order and restore the deducted stock
           setOrders((prev) => prev.filter((o) => o.id !== orderPayload.id));
-          setProduceList((prev) => {
-            const restored = prev.map((prod) => {
-              const plan = deductionPlan.get(prod.id);
-              if (plan) {
-                const restoredStock = plan.originalStock;
-                return {
-                  ...prod,
-                  stockQuantity: restoredStock,
-                  sellerStatus:
-                    prod.sellerStatus === 'sold_out' && restoredStock > 0
-                      ? ('bought_and_stocked' as const)
-                      : prod.sellerStatus,
-                };
-              }
-              return prod;
-            });
-            localStorage.setItem(STORAGE_KEYS.PRODUCE, JSON.stringify(restored));
-            return restored;
-          });
           showToast(`⚠️ ${msg}`);
         }
       })
@@ -1716,7 +1640,12 @@ export default function App() {
     orderId: string,
     newStatus: OrderStatus,
     cancelReason?: string,
-    cancelledBy?: string
+    cancelledBy?: string,
+    // Partial fulfillment (v4.11): the order adjusted by the Admin desk to the
+    // AVAILABLE quantities (shortfall recorded as a refund) — replaces the
+    // stale order in both the local state and the backend PUT so the buyer is
+    // charged only for the delivered products.
+    adjustedOrder?: Order
   ) => {
     const cleanOrderId = String(orderId || '').replace('#', '').trim().toLowerCase();
     const targetOrder =
@@ -1749,22 +1678,20 @@ export default function App() {
           p.farmerId === 'admin-main' ||
           (typeof p.id === 'string' && p.id.startsWith('sm-'));
 
-        // Only return stock that was actually taken off the shelf:
-        //  • Direct basket lots (real produce ids) were deducted at checkout →
-        //    always restock.
-        //  • REQUEST lots ("req-prod-*" ids) were deducted ONLY when the order
-        //    left 'pending' (fulfilled). Cancelling a still-pending request
-        //    must NOT restock — nothing was ever deducted, and doing so would
-        //    create phantom stock on the admin's Stocks menu.
+        // Only return stock that was actually taken off the shelf. Since
+        // v4.6 NOTHING is deducted when a request is submitted — stock is
+        // taken only when the order first leaves 'pending' (fulfilled).
+        // Cancelling a still-pending request must NOT restock — neither
+        // request lots nor direct basket ids — because no kilo was ever
+        // deducted from any farmer or shelf.
         const cancelWasFulfilled =
           (targetOrder as any)?.requestStockDeducted === true || previousStatus !== 'pending';
-        const isReqLotForRestock = (pid: any) => !pid || String(pid).startsWith('req-prod-');
 
         const restockTargets = new Map<string, number>();
         itemsToRestock.forEach((it) => {
           const qty = Number(it.quantity) || 0;
           if (qty <= 0) return;
-          if (isReqLotForRestock(it.produceId) && !cancelWasFulfilled) return;
+          if (!cancelWasFulfilled) return; // nothing was deducted for a pending request
           const requestedName = String(it.produceName || '').trim().toLowerCase();
           const target =
             produceList.find((p) => it.produceId && p.id === it.produceId) ||
@@ -1933,11 +1860,7 @@ export default function App() {
       'in_transit',
       'completed',
     ];
-    const isRequestLotItem = (pid: any) => !pid || String(pid).startsWith('req-prod-');
-
-    const orderHadRequestLots = Boolean(
-      targetOrder && (targetOrder.items || []).some((it) => isRequestLotItem(it.produceId))
-    );
+    const orderHasStockableItems = Boolean(targetOrder && (targetOrder.items || []).length > 0);
 
     // Regular non-cancellation status update
     setOrders((prev) => {
@@ -1945,9 +1868,13 @@ export default function App() {
         o.id === orderId
           ? {
               ...o,
+              ...(adjustedOrder || {}),
               status: newStatus,
-              // Exactly-once marker: request lots are now deducted for this order
-              ...(orderHadRequestLots && !o.requestStockDeducted && FULFILLMENT_STATUSES.includes(newStatus)
+              // Exactly-once marker: since v4.6 EVERY buyer order deducts its
+              // stock at first fulfillment (nothing is taken at submission),
+              // so any order with items gets the marker on its first
+              // fulfillment transition.
+              ...(orderHasStockableItems && !o.requestStockDeducted && FULFILLMENT_STATUSES.includes(newStatus)
                 ? { requestStockDeducted: true }
                 : {}),
             }
@@ -1980,7 +1907,13 @@ export default function App() {
     fetch(`/api/orders/${orderId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(targetOrder ? { ...targetOrder, status: newStatus } : { status: newStatus }),
+      body: JSON.stringify(
+        adjustedOrder
+          ? { ...adjustedOrder, status: newStatus }
+          : targetOrder
+          ? { ...targetOrder, status: newStatus }
+          : { status: newStatus }
+      ),
     })
       .then(async (res) => {
         if (res.status === 409) {
@@ -1999,6 +1932,31 @@ export default function App() {
       })
       .catch((e) => console.log('Order status sync notice:', e));
 
+    // ── Partial fulfillment wallet refund (v4.11) ────────────────────────────
+    // A PAID order fulfilled with less stock than requested charges the buyer
+    // ONLY for the delivered products: the shortfall (already recorded in
+    // adjustedOrder.refundedTotal by the Admin desk) is credited back to the
+    // buyer's VeggieConnect Pay wallet. Unpaid orders were never charged —
+    // the shortfall simply drops off the bill.
+    if (adjustedOrder && targetOrder?.paymentStatus === 'paid') {
+      const refundDue = Math.round((orderPayable(targetOrder) - orderPayable(adjustedOrder)) * 100) / 100;
+      if (refundDue > 0 && targetOrder.buyerId) {
+        void postWalletTransaction(
+          targetOrder.buyerId,
+          'refund',
+          refundDue,
+          `Refund — partial fulfillment (Order ${targetOrder.id})`,
+          targetOrder.id
+        ).then((updated) => {
+          if (updated) {
+            showToast(
+              `↩️ ₱${refundDue.toLocaleString()} refunded to ${targetOrder.buyerName}'s wallet — order fulfilled with the available products only.`
+            );
+          }
+        });
+      }
+    }
+
     appSync.publish('ORDERS_UPDATED', { id: orderId, status: newStatus }, 'admin');
     showToast(`Order status updated to "${newStatus.replace('_', ' ')}"`);
   };
@@ -2012,6 +1970,22 @@ export default function App() {
       phone: '',
       location: 'Dumaguete City',
     };
+
+    // One active haul per transporter — busy until that transaction is
+    // completed (client twin of the server's TRANSPORTER_BUSY rule, so the
+    // demo shows the message instead of a silent 409).
+    const activeHaul = transportJobs.find(
+      (j) =>
+        j.id !== jobId &&
+        j.assignedTransporterId === transporter.id &&
+        (j.status === 'accepted' || j.status === 'picked_up' || j.status === 'in_transit')
+    );
+    if (activeHaul) {
+      showToast(
+        `⚠️ ${transporter.name} is still delivering order #${activeHaul.orderId}. They can accept a new haul once that transaction is completed.`
+      );
+      return;
+    }
 
     setTransportJobs((prev) =>
       prev.map((j) =>
@@ -2182,12 +2156,32 @@ export default function App() {
     };
     setProduceList((prev) => [newItem, ...prev]);
 
-    // Send to backend API
+    // Send to backend API, then reconcile with the AUTHORITATIVE response.
+    // The server merges a re-listed crop into the farmer's existing listing
+    // (same farmer + same normalized crop name + same unit): the response then
+    // carries the EXISTING record's id with the combined stock and the new
+    // price. Replacing by id (and dropping this optimistic temp card) keeps
+    // My Crops free of duplicates — and the merged card is what the admin's
+    // Crops section receives from the backend as well.
     fetch('/api/products', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newItem),
-    }).catch((e) => console.log('Product sync notice:', e));
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((saved: ProduceItem | null) => {
+        if (!saved || !saved.id) return;
+        setProduceList((prev) => {
+          const withoutTemp = prev.filter((x) => x.id !== newItem.id);
+          const exists = withoutTemp.some((x) => x.id === saved.id);
+          const nextList = exists
+            ? withoutTemp.map((x) => (x.id === saved.id ? saved : x))
+            : [saved, ...withoutTemp];
+          localStorage.setItem(STORAGE_KEYS.PRODUCE, JSON.stringify(nextList));
+          return nextList;
+        });
+      })
+      .catch((e) => console.log('Product sync notice:', e));
 
     showToast(`Vegetable listed for sale: ${newItem.name}`);
   };
@@ -2270,13 +2264,17 @@ export default function App() {
 
   const handleUpdateProducePrice = (id: string, newPrice: number) => {
     setProduceList((prev) =>
-      prev.map((item) => (item.id === id ? { ...item, pricePerUnit: newPrice } : item))
+      prev.map((item) =>
+        item.id === id ? { ...item, pricePerUnit: newPrice, farmgateAskingPrice: newPrice } : item
+      )
     );
 
     fetch(`/api/products/${id}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pricePerUnit: newPrice }),
+      // farmgateAskingPrice rides along so the admin's Crops menu (which reads
+      // the legacy farmgate field) shows the SAME current price.
+      body: JSON.stringify({ pricePerUnit: newPrice, farmgateAskingPrice: newPrice }),
     }).catch((e) => console.log('Price sync notice:', e));
 
     showToast(`Updated crop price to ₱${newPrice.toFixed(2)}/unit based on DA Bantay Presyo`);
@@ -2316,8 +2314,19 @@ export default function App() {
     const remainingFarmerStock = Math.max(0, farmerProduce.stockQuantity - boughtQuantity);
     const updatedBoughtTotal = (farmerProduce.boughtQuantity || 0) + boughtQuantity;
 
-    // 2. Do NOT auto-create/merge Live Supermarket Stock — the fresh produce stays
-    //    in Owned / Bought until the admin manually uses "Put in Stock".
+    // (Live Supermarket Stock entries are only created via the manual "Put in Stock" action)
+
+    // Farmer-lot deduction is SERVER-authoritative: the TX-ADM- procurement
+    // order posted below is fulfilled by the backend the moment it arrives
+    // ('confirmed' is a fulfillment status) — it deducts the farmer's lot
+    // EXACTLY ONCE, updates boughtQuantity and stocks the warehouse (the
+    // Stocks menu grows immediately). This desk used to ALSO send a stock
+    // PUT here, so the farmer's lot was deducted twice (UI PUT + engine),
+    // and when the desk bought the WHOLE listing the lot hit 0 before the
+    // engine ran — its allocation came back empty and the warehouse add was
+    // skipped entirely, so the bought kilograms never showed up in Stocks
+    // while a buyer transaction was active. The update below is LOCAL/visual
+    // only; the 2.5s poll reconciles to the server's post-fulfillment truth.
     const updatedList: ProduceItem[] = produceList.map((p) =>
       p.id === farmerProduce.id
         ? {
@@ -2329,19 +2338,6 @@ export default function App() {
           }
         : p
     );
-
-    // (Live Supermarket Stock entries are only created via the manual "Put in Stock" action)
-
-    // Always update farmer's remaining stock on backend
-    fetch(`/api/products/${farmerProduce.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        stockQuantity: remainingFarmerStock,
-        boughtQuantity: updatedBoughtTotal,
-        sellerStatus: remainingFarmerStock === 0 ? 'sold_out' : 'submitted',
-      }),
-    }).catch((e) => console.log('Farmer stock sync notice:', e));
 
     setProduceList(updatedList);
     localStorage.setItem(STORAGE_KEYS.PRODUCE, JSON.stringify(updatedList));
@@ -2852,28 +2848,13 @@ export default function App() {
   // 3. SOLD-OUT ITEMS HIDDEN — crops with 0 stock are never shown in the Market.
   // 4. Fully anonymized (farmers remain anonymous from buyers; no farmer name or
   //    farm/store name is exposed — buyers only see the VeggieConnect platform).
-  // 5. Deduplicated by vegetable name so buyers can easily browse and submit
-  //    purchase requests for a specific crop.
+  // 5. One entry per vegetable whose "kg left" is the SUM across every farmer
+  //    listing of that crop, so buyers browse and submit purchase requests for
+  //    a specific crop while seeing its true combined availability.
   const supermarketProduceList = useMemo(() => {
     const hubLocation = 'VeggieConnect Central Market (Dumaguete City)';
     const hubLat = 9.3080;
     const hubLng = 123.3105;
-
-    const anonymizedList: ProduceItem[] = [];
-
-    // Identifies produce that is owned/stocked by the Admin (VeggieConnect
-    // Supermarket warehouse). Such items must NEVER appear in the buyer Market —
-    // buyers browse the farmers' live crops and request them instead.
-    const isAdminStock = (p: ProduceItem): boolean =>
-      p.sellerStoreName === 'VeggieConnect Supermarket' ||
-      p.sellerStatus === 'bought_and_stocked' ||
-      p.farmName === 'VeggieConnect Supermarket' ||
-      p.farmerName === 'VeggieConnect Central Produce Hub' ||
-      p.farmerId === 'admin-main' ||
-      (typeof p.id === 'string' && p.id.startsWith('sm-'));
-
-    const stockOf = (v?: ProduceItem | null) =>
-      v ? (typeof v.stockQuantity === 'number' ? v.stockQuantity : parseInt(String(v.stockQuantity), 10) || 0) : 0;
 
     // Registered farmer identities (ids, farm names, farmer names). A crop may
     // only enter the buyer Market when it is still owned by one of these
@@ -2894,56 +2875,30 @@ export default function App() {
       if (currentUser.name) validFarmerNames.add(currentUser.name.trim().toLowerCase());
     }
 
-    const isOwnedByRegisteredFarmer = (p: ProduceItem): boolean =>
-      Boolean(
-        (p.farmerId && validFarmerIds.has(p.farmerId)) ||
-          (p.farmName && validFarmNames.has(p.farmName.trim().toLowerCase())) ||
-          (p.farmerName && validFarmerNames.has(p.farmerName.trim().toLowerCase()))
-      );
-
     // Only farmer-submitted crops with available stock enter the buyer Market.
-    // When several farmers list the same crop, keep the best-stocked listing so
-    // the market always surfaces the freshest availability.
-    const byName = new Map<string, ProduceItem>();
-    produceList.forEach((item) => {
-      if (!item) return;
-      if (isAdminStock(item)) return; // Admin warehouse stock is never listed
-      if (!isOwnedByRegisteredFarmer(item)) return; // Not a current farmer's listed crop
-      if (item.sellerStatus === 'archived' || item.sellerStatus === 'sold_out') return;
-      if (stockOf(item) <= 0) return; // Stock 0 = hidden from Market
-      const normName = (item.name || '').trim().toLowerCase();
-      if (!normName) return;
-      const existing = byName.get(normName);
-      if (!existing || stockOf(item) > stockOf(existing)) {
-        byName.set(normName, item);
-      }
-    });
-
-    byName.forEach((item) => {
-      const dynamicDist = calculateDistanceBetween(
-        buyerOrigin,
-        {
+    // When several farmers list the same crop, the Market shows ONE combined
+    // entry per crop whose "kg left" is the SUM of every farmer's available
+    // stock (Farmer A 50 kg + Farmer B 50 kg Calamansi → 100 kg) — see
+    // utils/marketCatalog.ts. Fulfillment still allocates across each
+    // farmer's actual lot via the sourcing plan.
+    return buildBuyerMarketCatalog(
+      produceList,
+      {
+        validFarmerIds,
+        validFarmNames,
+        validFarmerNames,
+      },
+      {
+        location: hubLocation,
+        lat: hubLat,
+        lng: hubLng,
+        distanceKm: calculateDistanceBetween(buyerOrigin, {
           lat: hubLat,
           lng: hubLng,
           location: hubLocation,
-        }
-      );
-
-      anonymizedList.push({
-        ...item,
-        farmerName: 'VeggieConnect Central Market',
-        farmName: 'VeggieConnect Central Market',
-        farmerId: 'admin-main',
-        sellerStoreName: 'VeggieConnect Central Market',
-        sourcingRegion: 'Negros Oriental',
-        location: hubLocation,
-        latitude: hubLat,
-        longitude: hubLng,
-        distanceKm: dynamicDist,
-      });
-    });
-
-    return anonymizedList;
+        }),
+      }
+    );
   }, [produceList, buyerOrigin, registeredUsers, currentUser]);
 
   const dynamicFarmers = useMemo(() => {
@@ -3356,6 +3311,17 @@ export default function App() {
     fetch(`/api/users/${userId}`, {
       method: 'DELETE',
     }).catch((err) => console.log('Admin delete user sync notice:', err));
+
+    // 5. Purge the deleted identity from the login screen's local account
+    // registry (veggieconnect_registered_users_v9). The registry used to keep
+    // deleted accounts forever, so re-registering the same name/phone/email
+    // was blocked with "already registered" even though the account was gone.
+    purgeRegisteredIdentity({
+      id: userId,
+      name: userToDelete?.name,
+      phone: userToDelete?.phone,
+      email: userToDelete?.email,
+    });
 
     showToast(`Removed ${userToDelete?.name || 'User'} and all associated produce listings.`);
   };

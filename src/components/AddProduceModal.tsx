@@ -159,9 +159,25 @@ export const AddProduceModal: React.FC<AddProduceModalProps> = ({
     }
   };
 
+  // DA price floor: the asking price may never be INPUT below the DA Suggested
+  // Direct price for the crop (e.g. Banana (Lakatan) → ₱55/kg minimum). A
+  // legacy listing already below the floor keeps its stored price only while
+  // it is left unchanged — any new lower input is rejected.
+  const daPriceFloor = matchedDAPrice ? matchedDAPrice.suggestedDirectFarmPrice : null;
+  const enteredPrice = parseFloat(pricePerUnit) || 0;
+  const originalPrice =
+    isEditMode && initialProduce ? parseFloat(String(initialProduce.pricePerUnit)) || 0 : null;
+  const priceFloorViolation =
+    daPriceFloor !== null &&
+    enteredPrice < daPriceFloor &&
+    !(originalPrice !== null && enteredPrice === originalPrice)
+      ? `Minimum ₱${daPriceFloor.toFixed(2)}/kg — the DA Suggested Direct price for ${matchedDAPrice!.commodity}. Your asking price cannot go below it.`
+      : null;
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
+    if (priceFloorViolation) return; // inline error under the price field explains why
 
     if (isEditMode && initialProduce && onEditProduce) {
       onEditProduce({
@@ -169,6 +185,9 @@ export const AddProduceModal: React.FC<AddProduceModalProps> = ({
         name: name.trim(),
         category: initialProduce.category || 'Vegetables',
         pricePerUnit: parseFloat(pricePerUnit) || 0,
+        // The asking price IS this number — keep the legacy farmgate field in
+        // lockstep so admin views never show a stale pre-edit price.
+        farmgateAskingPrice: parseFloat(pricePerUnit) || 0,
         unit: 'kg',
         stockQuantity: parseInt(stockQuantity, 10) || 0,
         harvestStatus: FRESH_PICK_STATUS,
@@ -186,6 +205,9 @@ export const AddProduceModal: React.FC<AddProduceModalProps> = ({
         name: name.trim(),
         category: 'Vegetables',
         pricePerUnit: parseFloat(pricePerUnit) || 0,
+        // The asking price IS this number — keep the legacy farmgate field in
+        // lockstep so admin views never show a stale pre-edit price.
+        farmgateAskingPrice: parseFloat(pricePerUnit) || 0,
         unit: 'kg',
         stockQuantity: parseInt(stockQuantity, 10) || 0,
         harvestStatus: FRESH_PICK_STATUS,
@@ -470,12 +492,22 @@ export const AddProduceModal: React.FC<AddProduceModalProps> = ({
                 required
                 value={pricePerUnit}
                 onChange={(e) => setPricePerUnit(e.target.value)}
-                className="w-full bg-neutral-50 border border-neutral-300 rounded-xl pl-7 pr-14 py-2 text-xs text-neutral-900 focus:outline-none focus:bg-white focus:border-emerald-600 font-bold"
+                className={`w-full bg-neutral-50 border rounded-xl pl-7 pr-14 py-2 text-xs text-neutral-900 focus:outline-none focus:bg-white font-bold ${
+                  priceFloorViolation
+                    ? 'border-red-400 focus:border-red-500'
+                    : 'border-neutral-300 focus:border-emerald-600'
+                }`}
               />
               <span className="text-xs text-neutral-500 font-medium absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none">
                 / kg
               </span>
             </div>
+            {priceFloorViolation && (
+              <p className="text-[10px] font-bold text-red-600 flex items-center gap-1 pt-0.5">
+                <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                {priceFloorViolation}
+              </p>
+            )}
           </div>
 
           {/* DA Price Recommendation Card - Negros Oriental */}
